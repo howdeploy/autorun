@@ -28,6 +28,18 @@ does not reproduce the exact official TB4 binary revision.
 No successful LonaRPG launch is claimed. The interpreter is a diagnostic option,
 not a confirmed compatibility fix.
 
+## Windows NUL device
+
+Revision 3 maps the Windows names `\\??\\NUL`, `\\DosDevices\\NUL` and
+`\\Device\\Null` to an in-memory Horizon character device. Reads return EOF,
+writes discard data, and seek returns zero; no backing file is created on SD.
+Each open has independent access flags. The server exposes a character-device
+descriptor and `FILE_DEVICE_NULL` metadata instead of treating NUL as a missing
+file in the Wine prefix. `[HZNULL]` in the Horizon trace records open results.
+
+This addresses an observed failed `CreateFileW("NUL")` during RGSS initialization.
+Whether it resolves the subsequent game crash still needs a console run.
+
 ## Language
 
 Russian is the initial language. Change it immediately under

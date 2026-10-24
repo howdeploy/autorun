@@ -76,6 +76,8 @@
 #include <netinet/tcp.h>
 
 #include <sys/iosupport.h>
+#include <assert.h>
+#include <limits.h>
 
 /* PE entry points and callbacks currently execute on the libnx host stack.
  * Keep the native TIB truthful; the WoW64 guest stack and allocation ownership
@@ -640,6 +642,7 @@ unsigned int horizon_set_process_machine( unsigned short machine )
 #define HORIZON_FD_TYPE_FILE 1
 #define HORIZON_FD_TYPE_DIR 2
 #define HORIZON_FD_TYPE_SOCKET 3
+#define HORIZON_FD_TYPE_CHAR 5
 #define HORIZON_FIRST_USER_HANDLE 0x0020
 #define HORIZON_LAST_USER_HANDLE 0xffef
 #define HORIZON_MAX_USER_HANDLES ((HORIZON_LAST_USER_HANDLE - HORIZON_FIRST_USER_HANDLE + 1) >> 1)
@@ -3451,6 +3454,104 @@ static void horizon_set_reent_errno( struct _reent *r, int error )
 {
     if (r) r->_errno = error;
     else errno = error;
+}
+
+static pthread_mutex_t horizon_null_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int horizon_null_device = -1;
+
+static int horizon_null_open_r( struct _reent *r, void *fdptr, const char *path, int flags, int mode )
+{
+    (void)path; (void)mode;
+    if ((flags & O_ACCMODE) != O_RDONLY && (flags & O_ACCMODE) != O_WRONLY &&
+        (flags & O_ACCMODE) != O_RDWR)
+    { horizon_set_reent_errno( r, EINVAL ); return -1; }
+    *(int *)fdptr = flags;
+    return 0;
+}
+
+static int horizon_null_close_r( struct _reent *r, void *fdptr )
+{
+    (void)r; (void)fdptr;
+    return 0;
+}
+
+static ssize_t horizon_null_read_r( struct _reent *r, void *fdptr, char *data, size_t size )
+{
+    (void)data; (void)size;
+    if ((*(int *)fdptr & O_ACCMODE) == O_WRONLY)
+    { horizon_set_reent_errno( r, EBADF ); return -1; }
+    return 0;
+}
+
+static ssize_t horizon_null_write_r( struct _reent *r, void *fdptr, const char *data, size_t size )
+{
+    (void)data;
+    if ((*(int *)fdptr & O_ACCMODE) == O_RDONLY)
+    { horizon_set_reent_errno( r, EBADF ); return -1; }
+    if (size > (size_t)SSIZE_MAX)
+    { horizon_set_reent_errno( r, EINVAL ); return -1; }
+    return size;
+}
+
+static off_t horizon_null_seek_r( struct _reent *r, void *fdptr, off_t offset, int origin )
+{
+    (void)fdptr; (void)offset;
+    if (origin != SEEK_SET && origin != SEEK_CUR && origin != SEEK_END)
+    { horizon_set_reent_errno( r, EINVAL ); return -1; }
+    return 0;
+}
+
+static int horizon_null_fstat_r( struct _reent *r, void *fdptr, struct stat *st )
+{
+    (void)r; (void)fdptr;
+    memset( st, 0, sizeof(*st) );
+    st->st_mode = S_IFCHR | 0666;
+    st->st_nlink = 1;
+    return 0;
+}
+
+static int horizon_null_stat_r( struct _reent *r, const char *path, struct stat *st )
+{
+    (void)path;
+    return horizon_null_fstat_r( r, NULL, st );
+}
+
+static const devoptab_t horizon_null_devoptab =
+{
+    .name = "winenull",
+    .structSize = sizeof(int),
+    .open_r = horizon_null_open_r,
+    .close_r = horizon_null_close_r,
+    .read_r = horizon_null_read_r,
+    .write_r = horizon_null_write_r,
+    .seek_r = horizon_null_seek_r,
+    .fstat_r = horizon_null_fstat_r,
+    .stat_r = horizon_null_stat_r,
+    .lstat_r = horizon_null_stat_r,
+};
+
+/* Like /dev/null: every open has an independent descriptor and no storage. */
+const char *horizon_null_path(void)
+{
+    int device;
+    pthread_mutex_lock( &horizon_null_mutex );
+    device = __atomic_load_n( &horizon_null_device, __ATOMIC_RELAXED );
+    if (device == -1)
+    {
+        device = FindDevice( "winenull:" );
+        if (device == -1) device = AddDevice( &horizon_null_devoptab );
+        __atomic_store_n( &horizon_null_device, device, __ATOMIC_RELAXED );
+    }
+    pthread_mutex_unlock( &horizon_null_mutex );
+    if (device == -1) { errno = EMFILE; return NULL; }
+    return "winenull:";
+}
+
+int horizon_is_null_fd( int fd )
+{
+    __handle *handle;
+    int device = __atomic_load_n( &horizon_null_device, __ATOMIC_RELAXED );
+    return fd >= 0 && device >= 0 && (handle = __get_handle( fd )) && handle->device == (unsigned int)device;
 }
 
 /* The descriptors of sections with no file (horizon_memfile.h). */
@@ -9439,6 +9540,7 @@ static int horizon_server_handle_create_file( struct horizon_server_connection *
     if (!reply.header.error && !is_dir)
     {
         fd = open( filename, flags, 0666 );
+        if (fd >= 0 && !strcmp( filename, "winenull:" )) assert( horizon_is_null_fd( fd ) );
         if (fd == -1)
         {
             int open_errno = errno;
@@ -9476,7 +9578,7 @@ static int horizon_server_handle_create_file( struct horizon_server_connection *
             entry->object->file_options = request->options;
             entry->object->file_is_dir = is_dir;
             entry->object->file_sharing = request->sharing;
-            entry->object->file_shared = !is_dir;
+            entry->object->file_shared = !is_dir && !horizon_is_null_fd( fd );
             reply.handle = entry->handle;
             stored_name = NULL;
             fd = -1;
@@ -9488,6 +9590,9 @@ static int horizon_server_handle_create_file( struct horizon_server_connection *
     if (fd != -1) close( fd );
     if (reply.header.error && filename)
         horizon_report_missing_file( filename, reply.header.error, request, open_error );
+    if (filename && !strcmp( filename, "winenull:" ))
+        horizon_trace( "[HZNULL] create handle=%08x access=%08x status=%08x\n",
+                       reply.handle, request->access, reply.header.error );
     if (is_dir)
         horizon_trace( "[HZDIR] create path=%s handle=%08x err=%08x\n",
                        filename ? filename : "<null>", reply.handle, reply.header.error );
@@ -9747,7 +9852,7 @@ static int horizon_server_handle_get_handle_fd( struct horizon_server_connection
     }
     else
     {
-        reply.type = HORIZON_FD_TYPE_FILE;
+        reply.type = horizon_is_null_fd( entry->object->file_fd ) ? HORIZON_FD_TYPE_CHAR : HORIZON_FD_TYPE_FILE;
         reply.cacheable = 0;
         reply.access = entry->object->file_access;
         reply.options = entry->object->file_options;

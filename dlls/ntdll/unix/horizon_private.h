@@ -56,6 +56,8 @@ extern void horizon_mark_std_stream( HANDLE handle, int stream );
 extern void horizon_echo_std_write( HANDLE handle, const void *data, size_t size );
 struct stat;
 extern int horizon_stat_open_file( const char *path, struct stat *st );
+extern const char *horizon_null_path(void);
+extern int horizon_is_null_fd( int fd );
 
 /* Live resources that each Wine thread owns; updated atomically. */
 struct horizon_lifecycle_counters

@@ -76,9 +76,9 @@ u32 __nx_exception_ignoredebug = 1;
 #ifdef WINE_NX_AMD64
 #define WINE_NX_RUNTIME_BUILD "nx-amd64-box64-3"
 #elif defined(WINE_NX_BOX64_DYNAREC)
-#define WINE_NX_RUNTIME_BUILD "howdeploy-tb4-ru-dynarec-2"
+#define WINE_NX_RUNTIME_BUILD "howdeploy-tb4-ru-dynarec-3"
 #else
-#define WINE_NX_RUNTIME_BUILD "howdeploy-tb4-ru-interpreter-2"
+#define WINE_NX_RUNTIME_BUILD "howdeploy-tb4-ru-interpreter-3"
 #endif
 #define MAX_RUNTIME_MODULES 64
 #define MAX_IMPORT_DEPTH 16

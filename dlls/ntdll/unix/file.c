@@ -4437,6 +4437,24 @@ NTSTATUS nt_to_unix_file_name( OBJECT_ATTRIBUTES *attr, UNICODE_STRING *nt_name,
 
     nameW = attr->ObjectName;
 
+#ifdef __SWITCH__
+    {
+        static const WCHAR nulW[] = {'\\','?','?','\\','N','U','L'};
+        static const WCHAR dosnulW[] = {'\\','D','o','s','D','e','v','i','c','e','s','\\','N','U','L'};
+        static const WCHAR nullW[] = {'\\','D','e','v','i','c','e','\\','N','u','l','l'};
+        if ((nameW->Length == sizeof(nulW) && !wcsnicmp( nameW->Buffer, nulW, ARRAY_SIZE(nulW) )) ||
+            (nameW->Length == sizeof(dosnulW) && !wcsnicmp( nameW->Buffer, dosnulW, ARRAY_SIZE(dosnulW) )) ||
+            (nameW->Length == sizeof(nullW) && !wcsnicmp( nameW->Buffer, nullW, ARRAY_SIZE(nullW) )))
+        {
+            const char *path = horizon_null_path();
+            if (!path) return errno_to_status( errno );
+            nt_name->Buffer = NULL;
+            *name_ret = strdup( path );
+            return *name_ret ? STATUS_SUCCESS : STATUS_NO_MEMORY;
+        }
+    }
+#endif
+
     if (nameW->Length >= sizeof(deviceW) - sizeof(WCHAR)
         && !wcsnicmp( nameW->Buffer, deviceW, ARRAY_SIZE(deviceW) - 1 ))
     {
@@ -8190,6 +8208,9 @@ NTSTATUS get_device_info( int fd, FILE_FS_DEVICE_INFORMATION *info )
     if (S_ISCHR( st.st_mode ))
     {
         info->DeviceType = FILE_DEVICE_UNKNOWN;
+#ifdef __SWITCH__
+        if (horizon_is_null_fd( fd )) info->DeviceType = FILE_DEVICE_NULL;
+#endif
 #ifdef linux
         switch(major(st.st_rdev))
         {
