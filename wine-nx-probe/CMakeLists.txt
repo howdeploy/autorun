@@ -1056,7 +1056,7 @@ if(NACPTOOL AND ELF2NRO)
     endif()
     add_custom_command(
         OUTPUT "${RUNTIME_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "${AUTORUN_NACP_NAME}" "howdeploy + Autorun contributors" "TB4 RU3" "${RUNTIME_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "${AUTORUN_NACP_NAME}" "howdeploy + Autorun contributors" "TB4 RU4" "${RUNTIME_NACP_FILE}"
         VERBATIM
     )
 

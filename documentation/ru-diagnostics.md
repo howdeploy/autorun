@@ -38,7 +38,33 @@ descriptor and `FILE_DEVICE_NULL` metadata instead of treating NUL as a missing
 file in the Wine prefix. `[HZNULL]` in the Horizon trace records open results.
 
 This addresses an observed failed `CreateFileW("NUL")` during RGSS initialization.
-Whether it resolves the subsequent game crash still needs a console run.
+The console log confirmed that NUL opens successfully and the game reaches Ruby
+script execution. Successful gameplay is still unconfirmed.
+
+## Thread-local Windows hooks
+
+Revision 4 implements thread-local in-context hook registration, chain lookup,
+`CallNextHookEx` and unhooking in the Horizon server. The original Wine client
+dispatches keyboard/mouse callbacks and honors their return values. Shared
+queue hook counts are updated, registrations run newest first, and removal
+during a callback keeps the old handle alive until the outermost chain ends.
+Thread termination frees its hooks and invalidates their user handles.
+
+This covers the local `WH_KEYBOARD` registration in F1AltEnterF12.dll and the
+local `WH_MOUSE` registration in LonaMouseWheel.dll. Their DLLs and Ruby code are
+not patched or disabled. Global, low-level, journaling and out-of-context hooks
+remain unsupported and return an error. Other-process hook injection is not
+provided. The protocol layouts are checked at compile time against Wine's
+server header.
+
+`[HZHOOK]` records registration/removal results and the first 16 server-side
+callback deliveries per hook. A delivery log is not proof that the guest
+callback executed successfully. Compilation is the only validation performed;
+actual input filtering, callback chaining and game startup need a console run.
+The [SetWindowsHookExW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowshookexw)
+and [CallNextHookEx](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-callnexthookex)
+contracts, together with the pinned Wine `server/hook.c` and `dlls/win32u/hook.c`,
+are the implementation references.
 
 ## Language
 
