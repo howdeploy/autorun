@@ -4,10 +4,11 @@
 
 <h1 align="center">Autorun</h1>
 
-> **howdeploy fork: Russian UI and Wi-Fi diagnostics.** Based on upstream
+> **howdeploy fork: Russian UI, FTP and Wi-Fi diagnostics.** Based on upstream
 > `test-build-4`. See [fork usage and build notes](documentation/ru-diagnostics.md).
-> Fork binaries are experimental OpenGL builds, supplied as additional NRO files
-> for an existing TB4 installation. Upstream compatibility results below do not
+> Fork binaries are experimental OpenGL runtimes for an existing TB4 installation.
+> Settings → System → FTP server provides file transfers with a saved account.
+> Upstream compatibility results below do not
 > establish compatibility of these binaries. No console or runtime tests have
 > been performed for this fork.
 

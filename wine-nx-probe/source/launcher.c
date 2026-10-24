@@ -49,6 +49,7 @@
 #include "box64_options.h"
 #include "launcher_i18n.h"
 #include "diagnostics.h"
+#include "ftp_server.h"
 #define snprintf launcher_snprintf
 
 #define ICON_SIDE      128    /* icons are decoded no larger than this */
@@ -2907,7 +2908,7 @@ enum settings_row
     SET_HIDDEN, SET_HIDE_MISSING, SET_DXVK_ON_ADD, SET_VERBOSE, SET_PROFILE, SET_WINDOWS, SET_SWKBD,
     SET_CONTROLS, SET_STEAMGRIDDB,
     SET_UPDATE, SET_REOPEN, SET_FORWARDER, SET_MAKE_32BIT, SET_MAKE_MAIN,
-    SET_CREDITS, SET_LANGUAGE, SET_DIAGNOSTICS, SETTINGS_ROWS
+    SET_CREDITS, SET_LANGUAGE, SET_DIAGNOSTICS, SET_FTP, SETTINGS_ROWS
 };
 
 /* Which forwarder to send a game to when this one cannot run it. The console
@@ -2981,6 +2982,8 @@ static void save_look( struct launcher *l )
 /* What Wine-NX is built from and on; README.md's Credits section has the same list. */
 static const struct { const char *name, *value, *help; } credits[] =
 {
+    { "ftpsrv", "TotalJustice, MIT",
+      "https://github.com/ITotalJustice/ftpsrv\nThe local FTP server for games, settings and diagnostic reports." },
     { "Wine", "WineHQ, LGPL-2.1+",
       "https://www.winehq.org\nThe Windows API, the loader, WoW64 and the Direct3D, OpenGL and Vulkan layers." },
     { "Box64", "ptitSeb, MIT",
@@ -3304,6 +3307,28 @@ static void credits_screen( struct launcher *l )
     }
 }
 
+static void reload_after_ftp( struct launcher *l )
+{
+    char path[512], language[16] = "ru";
+    stop_icons( l );
+    l->stop = 0;
+    l->program_count = 0;
+    l->backdrop = l->backdrop_previous = -1;
+    runtime_file( l, "launcher.txt", path, sizeof(path) );
+    if (launcher_kv_load( &l->look, path ))
+    {
+        l->show_hidden = launcher_kv_get_int( &l->look, "show-hidden", 0 ) == 1;
+        l->hide_missing = launcher_kv_get_int( &l->look, "hide-missing", 0 ) == 1;
+        launcher_kv_get( &l->look, "browse", l->browse_dir, sizeof(l->browse_dir) );
+        launcher_kv_get( &l->look, "language", language, sizeof(language) );
+        launcher_set_language( language );
+    }
+    load_library( l );
+    rebuild_visible( l, -1 );
+    rebuild_history( l, -1 );
+    start_icons( l );
+}
+
 /* The sections of Settings, in the order they stand in the list. */
 enum settings_section { SET_SECTION_LIBRARY, SET_SECTION_DEFAULTS, SET_SECTION_ARTWORK, SET_SECTION_SYSTEM };
 
@@ -3337,6 +3362,7 @@ static void settings_menu( struct launcher *l )
             [SET_SWKBD] = SET_SECTION_SYSTEM,
             [SET_LANGUAGE] = SET_SECTION_SYSTEM,
             [SET_DIAGNOSTICS] = SET_SECTION_SYSTEM,
+            [SET_FTP] = SET_SECTION_SYSTEM,
         };
 
         memset( rows, 0, sizeof(rows) );
@@ -3452,6 +3478,10 @@ static void settings_menu( struct launcher *l )
         rows[SET_DIAGNOSTICS].kind = UI_ROW_ACTION;
         rows[SET_DIAGNOSTICS].adjustable = 0;
         rows[SET_DIAGNOSTICS].help = "Create a ZIP with logs and diagnostic settings. No game files, saves or raw settings are included.";
+        snprintf( rows[SET_FTP].label, sizeof(rows[0].label), "FTP server" );
+        rows[SET_FTP].kind = UI_ROW_ACTION;
+        rows[SET_FTP].adjustable = 0;
+        rows[SET_FTP].help = "Upload games and settings, or download logs. The server is limited to switch/wine.";
 
         action = ui_settings_run( ui, &list, "Settings", NULL, sections,
                                   sizeof(sections) / sizeof(sections[0]), rows, SETTINGS_ROWS, 0, &section );
@@ -3473,7 +3503,19 @@ static void settings_menu( struct launcher *l )
             ui_start_screen( ui );
             break;
         case SET_DIAGNOSTICS:
-            if (action == UI_ACTION_CHOOSE) diagnostics_screen( ui, l->options );
+            if (action == UI_ACTION_CHOOSE)
+            {
+                save_look( l );
+                if (diagnostics_screen( ui, l->options )) reload_after_ftp( l );
+            }
+            ui_start_screen( ui );
+            break;
+        case SET_FTP:
+            if (action == UI_ACTION_CHOOSE)
+            {
+                save_look( l );
+                if (ftp_server_screen( ui, l->options )) reload_after_ftp( l );
+            }
             ui_start_screen( ui );
             break;
         case SET_HIDE_MISSING: l->hide_missing = !l->hide_missing; break;

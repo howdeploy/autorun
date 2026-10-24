@@ -5,15 +5,15 @@ This fork starts at upstream `test-build-4`, commit
 controller navigation and runtime data format. The existing Home, Library,
 Settings and per-game screens are the UI reference; no redesign is intended.
 
-## Install alongside an existing TB4 installation
+## Install over an existing TB4 installation
 
-These binaries are **additional runtime NROs**, not a complete Wine distribution.
-Keep the original `switch/wine/wine-nx-runtime.nro` and the rest of the TB4
-installation. Copy the new NRO into `switch/wine/` under its supplied name and
-open that file through a homebrew launcher. It uses the existing `switch/wine`
-prefix, library and game files. Runtime settings remain shared with the original
-app; back them up before experimenting. No firmware, kernel or partition changes
-are needed.
+These binaries are **runtime NROs**, not a complete Wine distribution. Keep the
+TB4 prefix, DLLs and game files. To use the existing forwarder, replace
+`switch/wine/wine-nx-runtime.nro` with the selected fork NRO under that exact name.
+An additional NRO can instead be opened separately, but an existing 32-bit
+forwarder can still send games back to its configured original path. Check the
+runtime build and address-space size in the log. No firmware, kernel or partition
+changes are needed.
 
 - `autorun-ru-interpreter.nro`: Box64 interpreter, intended to investigate failures
   involving translated or self-modifying code. It is expected to be slow.
@@ -45,17 +45,39 @@ their original text. Strings without a translation fall back to English.
    reduce performance, so leave it off for normal play.
 2. Launch the game. After it ends, return to Autorun. If it crashes the runtime,
    reopen this NRO; the separate game-session log survives the restart.
-3. Select **Download report over Wi-Fi** in Diagnostics.
-4. Open the displayed HTTP URL in a browser on a PC on the same LAN. Keep the
-   sharing screen open until the download finishes. Press **B** or choose
-   **Stop sharing** to close the server. No Sphaira transition is required.
+3. Select **Create report and open FTP** in Diagnostics, then **Start FTP**.
+4. Connect a normal FTP client to the Switch IP and saved port (default **5000**)
+   with your saved username and password. Download the newest ZIP from `/reports`.
+   No URL token needs to be copied. The former temporary HTTP download is replaced
+   by this FTP flow.
 
-The listener is started only for this screen. Its port is assigned by the OS,
-and each session has a random URL token. Only an exact GET of that report is
-served; the URL cannot browse the SD card or select another file. No SSH, shell,
-external upload or public cloud is involved. Anyone who obtains the URL while
-the screen is open can download the report. LAN isolation or routing rules can
-still prevent connectivity; this feature does not require disabling a PC VPN.
+## Transfer games, settings and logs
+
+Open **Settings → System → FTP server** / **Настройки → Система → FTP-сервер**.
+Configure a username, password and port once, then select **Start FTP**. The
+account is saved privately in `switch/wine/config/ftp.txt`; anonymous access is
+disabled and FTP commands/passwords are not written to the diagnostic log.
+Use passive FTP mode, as used by standard clients and Python's `ftplib`.
+
+FTP `/` is `switch/wine`, not the SD root. Upload games into `/drive_c`, their
+sidecar settings beside the executables, global settings into `/config`, and
+download logs from `/logs` or ZIP reports from `/reports`. File transfers,
+directory creation, rename, removal and resuming transfers use the embedded
+[ftpsrv](../wine-nx-probe/third_party/ftpsrv/README.md) implementation.
+Device paths, parent traversal and symlinks cannot select files outside this
+root. Active and passive data connections are restricted to the control peer.
+
+Keep the server screen open until transfers finish; **B** or **Stop FTP** closes
+the server and disconnects clients. The server is not running during gameplay.
+Launcher and per-game settings are reloaded afterward; registered library entries
+are reloaded too. Add newly uploaded executables using **+ → Add game**. Options
+outside the launcher's live settings may still require restarting Autorun.
+Wait for a transfer to finish before closing the screen or launching a game.
+
+No Sphaira transition, SSH, external upload or public cloud is involved. LAN
+isolation or routing rules can still prevent connectivity; this feature does not
+require disabling a PC VPN. Normal FTP does not encrypt traffic; use it on your
+local network.
 
 The completed ZIP also remains in `switch/wine/reports/`. Reports include up to
 64 newest `.log` files plus eligible `stdout.txt` / `stderr.txt` from `logs/`,
@@ -67,7 +89,7 @@ settings, address-space size, emuMMC status and skipped-file count.
 Game files, saves, stdin and raw settings files are not collected. **Log content
 is not redacted:** paths, arguments and diagnostic output may contain private
 information. Review it before posting it publicly. A failed export can leave a
-`.partial` file; incomplete reports are never served.
+`.partial` file; only completed `.zip` files should be downloaded as reports.
 
 ## Session logs
 
@@ -123,5 +145,5 @@ installation; these commands build the native runtime only.
 
 Validation for this change is compilation only. No host tests, GUI checks or
 Switch runtime tests were run, at the user's request. Console checks still need
-to cover Cyrillic rendering, language persistence, ZIP contents, LAN download,
-server shutdown and the game's behavior.
+to cover Cyrillic rendering, language persistence, FTP authentication, transfers,
+root confinement, config reload, server shutdown and the game's behavior.

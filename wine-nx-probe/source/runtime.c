@@ -76,9 +76,9 @@ u32 __nx_exception_ignoredebug = 1;
 #ifdef WINE_NX_AMD64
 #define WINE_NX_RUNTIME_BUILD "nx-amd64-box64-3"
 #elif defined(WINE_NX_BOX64_DYNAREC)
-#define WINE_NX_RUNTIME_BUILD "howdeploy-tb4-ru-dynarec-1"
+#define WINE_NX_RUNTIME_BUILD "howdeploy-tb4-ru-dynarec-2"
 #else
-#define WINE_NX_RUNTIME_BUILD "howdeploy-tb4-ru-interpreter-1"
+#define WINE_NX_RUNTIME_BUILD "howdeploy-tb4-ru-interpreter-2"
 #endif
 #define MAX_RUNTIME_MODULES 64
 #define MAX_IMPORT_DEPTH 16
@@ -3550,6 +3550,30 @@ static void log_line_plain( const char *line )
     log_line( "%s", line );
 }
 
+static int launcher_sync_settings( struct wine_nx_launcher_options *options, int save )
+{
+    if (save)
+    {
+        wine_nx_config_set_bool( &runtime_config, "verbose-log", options->verbose );
+        wine_nx_config_set_bool( &runtime_config, "profiler", options->profile );
+        wine_nx_config_set_bool( &runtime_config, "windows-through-opengl", !options->framebuffer );
+        wine_nx_config_set_bool( &runtime_config, "reopen-the-launcher-on-exit", options->reopen_launcher );
+        wine_nx_config_set_bool( &runtime_config, "dxvk-for-new-games", options->dxvk_on_add );
+        wine_nx_config_set_bool( &runtime_config, "keyboard-on-text-focus", options->swkbd_auto );
+        return wine_nx_config_save( &runtime_config, CONFIG_FILE );
+    }
+    struct wine_nx_config uploaded;
+    if (!wine_nx_config_load( &uploaded, CONFIG_FILE )) return 0;
+    runtime_config = uploaded;
+    options->verbose = wine_nx_config_bool( &runtime_config, "verbose-log", options->verbose );
+    options->profile = wine_nx_config_bool( &runtime_config, "profiler", options->profile );
+    options->framebuffer = !wine_nx_config_bool( &runtime_config, "windows-through-opengl", !options->framebuffer );
+    options->reopen_launcher = wine_nx_config_bool( &runtime_config, "reopen-the-launcher-on-exit", options->reopen_launcher );
+    options->dxvk_on_add = wine_nx_config_bool( &runtime_config, "dxvk-for-new-games", options->dxvk_on_add );
+    options->swkbd_auto = wine_nx_config_bool( &runtime_config, "keyboard-on-text-focus", options->swkbd_auto );
+    return 1;
+}
+
 static unsigned int launcher_install_forwarder( int bits, const char *name, unsigned long long *id,
                                                 const char **step )
 {
@@ -3830,6 +3854,7 @@ int main( int argc, char **argv )
             .nro_path = own_nro,
             .emummc = runtime_on_emummc(),
             .build = WINE_NX_RUNTIME_BUILD,
+            .sync_settings = launcher_sync_settings,
             .machine_of = launcher_machine,
 #ifdef WINE_NX_USB_STORAGE
             .list_usb = wine_nx_usb_list,
@@ -3881,16 +3906,10 @@ int main( int argc, char **argv )
         wine_nx_compositor_mode = !options.framebuffer;
         /* The launcher changes settings; keeping them is the runtime's, which
          * owns the file and knows every other setting in it. */
-        wine_nx_config_set_bool( &runtime_config, "verbose-log", options.verbose );
-        wine_nx_config_set_bool( &runtime_config, "profiler", options.profile );
-        wine_nx_config_set_bool( &runtime_config, "windows-through-opengl", !options.framebuffer );
-        wine_nx_config_set_bool( &runtime_config, "reopen-the-launcher-on-exit", options.reopen_launcher );
+        launcher_sync_settings( &options, 1 );
         runtime_reopen_launcher = options.reopen_launcher;
-        wine_nx_config_set_bool( &runtime_config, "dxvk-for-new-games", options.dxvk_on_add );
         runtime_dxvk_on_add = options.dxvk_on_add;
-        wine_nx_config_set_bool( &runtime_config, "keyboard-on-text-focus", options.swkbd_auto );
         wine_nx_swkbd_auto_enabled = options.swkbd_auto;
-        wine_nx_config_save( &runtime_config, CONFIG_FILE );
         if (!chosen)
         {
             log_line( "[LAUNCHER] closed without starting a program" );

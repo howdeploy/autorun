@@ -606,6 +606,8 @@ add_executable(wine-nx-runtime
     source/launcher.c
     source/launcher_i18n.c
     source/diagnostics.c
+    source/ftp_server.c
+    source/ftp_server_vfs.c
     source/launcher_catalog.c
     source/launcher_console.c
     source/launcher_svg.c
@@ -902,7 +904,20 @@ set_source_files_properties(source/launcher.c source/launcher_catalog.c source/l
 set_property(SOURCE source/launcher_update.c APPEND PROPERTY COMPILE_DEFINITIONS WINE_NX_BUILD_VERSION)
 # The mark in the corner is only there in the build that generates it.
 set_property(SOURCE source/launcher.c APPEND PROPERTY COMPILE_DEFINITIONS WINE_NX_HAS_EMBEDDED_LOGO)
+add_library(autorun-ftpsrv STATIC third_party/ftpsrv/ftpsrv.c)
+target_include_directories(autorun-ftpsrv PUBLIC third_party/ftpsrv source)
+target_compile_definitions(autorun-ftpsrv PUBLIC
+    FTP_VFS_HEADER="ftp_server_vfs.h"
+    PRIVATE FTP_SOCKET_HEADER="socket_unistd.h"
+    FTP_MAX_SESSIONS=8 FTP_PATHNAME_SIZE=1024
+    HAVE_POLL=0 HAVE_SO_REUSEADDR=1 HAVE_SO_KEEPALIVE=1 HAVE_TCP_NODELAY=1
+    HAVE_STRNCASECMP=1 HAVE_LOCALTIME_R=1 HAVE_GMTIME_R=1
+    FTPSRV_VERSION_STR="1.2.2-autorun")
+set_source_files_properties(source/ftp_server.c PROPERTIES
+    INCLUDE_DIRECTORIES "$ENV{DEVKITPRO}/portlibs/switch/include/SDL2"
+    COMPILE_DEFINITIONS _REENTRANT)
 target_link_libraries(wine-nx-runtime PRIVATE
+    autorun-ftpsrv
     ${SWITCH_SDL2_TTF} ${SWITCH_SDL2}
     ${SWITCH_CURL} ${SWITCH_MBEDTLS} ${SWITCH_MBEDX509} ${SWITCH_MBEDCRYPTO} ${SWITCH_MINIZIP}
     ${SWITCH_FREETYPE} ${SWITCH_PNG} ${SWITCH_BZ2} ${SWITCH_Z} ${SWITCH_ZSTD} ${SWITCH_HARFBUZZ}
@@ -1041,7 +1056,7 @@ if(NACPTOOL AND ELF2NRO)
     endif()
     add_custom_command(
         OUTPUT "${RUNTIME_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "${AUTORUN_NACP_NAME}" "howdeploy + Autorun contributors" "TB4 RU1" "${RUNTIME_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "${AUTORUN_NACP_NAME}" "howdeploy + Autorun contributors" "TB4 RU2" "${RUNTIME_NACP_FILE}"
         VERBATIM
     )
 

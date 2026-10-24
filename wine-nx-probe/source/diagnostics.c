@@ -2,18 +2,14 @@
 #include "launcher.h"
 #include "launcher_i18n.h"
 #include "launcher_ui.h"
-#include <arpa/inet.h>
+#include "ftp_server.h"
 #include <dirent.h>
 #include <errno.h>
-#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 #include <minizip/zip.h>
@@ -27,13 +23,6 @@
 _Static_assert( REPORT_LIMIT >= FILE_LIMIT, "A report must hold one log" );
 
 struct report_file { char name[256]; size_t size; time_t modified; };
-struct report_server
-{
-    int listener;
-    pthread_t thread;
-    int stop;
-    char archive[512], route[64];
-};
 
 static int random_bytes( unsigned char *bytes, size_t count )
 {
@@ -161,132 +150,24 @@ int diagnostics_report( const struct wine_nx_launcher_options *options, char *pa
     return ok && !rename( temporary, path );
 }
 
-static int send_all( int socket, const void *data, size_t size, const int *stop )
+static int share_report( struct ui *ui, struct wine_nx_launcher_options *options )
 {
-    const char *bytes = data;
-    while (size)
-    {
-        int flags = 0;
-        if (stop && __atomic_load_n( stop, __ATOMIC_RELAXED )) return 0;
-#ifdef MSG_NOSIGNAL
-        flags = MSG_NOSIGNAL;
-#endif
-        int sent = send( socket, bytes, size, flags );
-        if (sent <= 0) return 0;
-        bytes += sent;
-        size -= sent;
-    }
-    return 1;
-}
-
-static void *serve_report( void *opaque )
-{
-    struct report_server *server = opaque;
-    while (!__atomic_load_n( &server->stop, __ATOMIC_RELAXED ))
-    {
-        struct timeval wait = { 0, 200000 }, timeout = { 3, 0 };
-        fd_set readers;
-        char request[2048], method[8], route[256], protocol[16], header[512], buffer[16384];
-        struct stat st;
-        FILE *file;
-        int client, bytes, complete = 0;
-        struct timespec deadline, current;
-        size_t received = 0, remaining;
-        FD_ZERO( &readers );
-        FD_SET( server->listener, &readers );
-        if (select( server->listener + 1, &readers, NULL, NULL, &wait ) <= 0) continue;
-        if ((client = accept( server->listener, NULL, NULL )) < 0) continue;
-        clock_gettime( CLOCK_MONOTONIC, &deadline );
-        deadline.tv_sec += 5;
-        setsockopt( client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout) );
-        setsockopt( client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout) );
-        while (received < sizeof(request) - 1 && !__atomic_load_n( &server->stop, __ATOMIC_RELAXED ))
-        {
-            clock_gettime( CLOCK_MONOTONIC, &current );
-            if (current.tv_sec > deadline.tv_sec ||
-                (current.tv_sec == deadline.tv_sec && current.tv_nsec >= deadline.tv_nsec)) break;
-            bytes = recv( client, request + received, sizeof(request) - 1 - received, 0 );
-            if (bytes <= 0) break;
-            received += bytes;
-            request[received] = 0;
-            if (strstr( request, "\r\n\r\n" )) { complete = 1; break; }
-        }
-        request[received] = 0;
-        if (!complete || sscanf( request, "%7s %255s %15s", method, route, protocol ) != 3 ||
-            strcmp( method, "GET" ) || strcmp( route, server->route ) ||
-            (strcmp( protocol, "HTTP/1.1" ) && strcmp( protocol, "HTTP/1.0" )))
-        {
-            const char *response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            send_all( client, response, strlen(response), &server->stop );
-        }
-        else if ((file = fopen( server->archive, "rb" )))
-        {
-            if (!fstat( fileno(file), &st ))
-            {
-                int length = snprintf( header, sizeof(header),
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: %llu\r\n"
-                    "Content-Disposition: attachment; filename=autorun-report.zip\r\n"
-                    "Cache-Control: no-store\r\nConnection: close\r\n\r\n", (unsigned long long)st.st_size );
-                remaining = st.st_size;
-                if (send_all( client, header, length, &server->stop ))
-                    while (remaining && !__atomic_load_n( &server->stop, __ATOMIC_RELAXED ))
-                    {
-                        size_t got = fread( buffer, 1, remaining < sizeof(buffer) ? remaining : sizeof(buffer), file );
-                        if (!got || !send_all( client, buffer, got, &server->stop )) break;
-                        remaining -= got;
-                    }
-            }
-            fclose( file );
-        }
-        close( client );
-    }
-    return NULL;
-}
-
-static void share_report( struct ui *ui, const struct wine_nx_launcher_options *options )
-{
-    struct report_server server = { .listener = -1 };
-    struct sockaddr_in address = { .sin_family = AF_INET, .sin_addr.s_addr = INADDR_ANY };
-    unsigned char token[8];
-    char url[160], text[1024], host[INET_ADDRSTRLEN];
-    socklen_t address_size = sizeof(address);
-    int i;
+    char archive[512];
+    int ready;
 
     ui_progress_begin( ui );
     ui_progress_update( ui, launcher_tr("Diagnostic report"), launcher_tr("Preparing report..."), 0, 0 );
-    i = diagnostics_report( options, server.archive, sizeof(server.archive) );
+    ready = diagnostics_report( options, archive, sizeof(archive) );
     ui_progress_end( ui );
-    if (!i) { ui_message( ui, "Diagnostics", "Report could not be created." ); return; }
-    if (!random_bytes( token, sizeof(token) )) goto failed;
-    for (i = 0; i < (int)sizeof(token); i++) snprintf( server.route + 1 + i * 2, 3, "%02x", token[i] );
-    server.route[0] = '/';
-    strcat( server.route, "/report.zip" );
-    if ((server.listener = socket( AF_INET, SOCK_STREAM, 0 )) < 0 ||
-        bind( server.listener, (struct sockaddr *)&address, sizeof(address) ) ||
-        listen( server.listener, 2 ) || getsockname( server.listener, (struct sockaddr *)&address, &address_size )) goto failed;
-    {
-        struct in_addr ip = { .s_addr = gethostid() };
-        if (!ip.s_addr || !inet_ntop( AF_INET, &ip, host, sizeof(host) )) goto failed;
-    }
-    if (pthread_create( &server.thread, NULL, serve_report, &server )) goto failed;
-    snprintf( url, sizeof(url), "http://%s:%u%s", host, ntohs(address.sin_port), server.route );
-    snprintf( text, sizeof(text), "%s\n\n%s\n\n%s",
-              url, launcher_tr("Connect your PC to the same local network. Keep this screen open. Press B to stop sharing."),
-              launcher_tr("The report may contain game paths and diagnostic output. Share it only with people you trust.") );
-    ui_confirm( ui, launcher_tr("Download report over Wi-Fi"), text, launcher_tr("Stop sharing") );
-    __atomic_store_n( &server.stop, 1, __ATOMIC_RELAXED );
-    pthread_join( server.thread, NULL );
-    close( server.listener );
-    return;
-failed:
-    if (server.listener >= 0) close( server.listener );
-    ui_message( ui, "Diagnostics", "Could not start the download server." );
+    if (!ready) { ui_message( ui, "Diagnostics", "Report could not be created." ); return 0; }
+    return ftp_server_screen( ui, options );
 }
 
-void diagnostics_screen( struct ui *ui, struct wine_nx_launcher_options *options )
+int diagnostics_screen( struct ui *ui, struct wine_nx_launcher_options *options )
 {
     struct ui_list list = {0};
     struct ui_row rows[3];
+    int served = 0;
     for (;;)
     {
         enum ui_action action;
@@ -297,13 +178,13 @@ void diagnostics_screen( struct ui *ui, struct wine_nx_launcher_options *options
         snprintf( rows[1].label, sizeof(rows[1].label), "%s", launcher_tr("Profiler") );
         rows[1].kind = UI_ROW_SWITCH; rows[1].on = !!options->profile; rows[1].adjustable = 1;
         rows[1].help = "[PROF] lines with where each thread spends its time.";
-        snprintf( rows[2].label, sizeof(rows[2].label), "%s", launcher_tr("Download report over Wi-Fi") );
+        snprintf( rows[2].label, sizeof(rows[2].label), "%s", launcher_tr("Create report and open FTP") );
         rows[2].kind = UI_ROW_ACTION;
         rows[2].help = "Create a ZIP with logs and diagnostic settings. No game files, saves or raw settings are included.";
         action = ui_list_run( ui, &list, "Diagnostics", NULL, rows, 3, 0 );
-        if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return;
+        if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return served;
         if (list.selection == 0) options->verbose = !options->verbose;
         else if (list.selection == 1) options->profile = !options->profile;
-        else if (action == UI_ACTION_CHOOSE) { share_report( ui, options ); ui_start_screen( ui ); }
+        else if (action == UI_ACTION_CHOOSE) { served |= share_report( ui, options ); ui_start_screen( ui ); }
     }
 }
