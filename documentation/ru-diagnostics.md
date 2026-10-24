@@ -57,6 +57,14 @@ remain unsupported and return an error. Other-process hook injection is not
 provided. The protocol layouts are checked at compile time against Wine's
 server header.
 
+The F1/F12 callback also calls `SetKeyboardState` on keyboard events. Revision 4
+adds its server request using Horizon's existing shared input state and Wine's
+desktop-state snapshot rules: synchronous overrides survive until the physical
+key changes; asynchronous state is changed only when explicitly requested.
+This retains Horizon's existing shared-input model rather than introducing
+separate input objects for each thread. `[HZKBD] set_key_state` records the first
+16 calls and any errors, without dumping the keyboard-state array.
+
 `[HZHOOK]` records registration/removal results and the first 16 server-side
 callback deliveries per hook. A delivery log is not proof that the guest
 callback executed successfully. Compilation is the only validation performed;
