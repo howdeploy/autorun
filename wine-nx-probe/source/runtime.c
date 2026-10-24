@@ -12,6 +12,7 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -75,9 +76,9 @@ u32 __nx_exception_ignoredebug = 1;
 #ifdef WINE_NX_AMD64
 #define WINE_NX_RUNTIME_BUILD "nx-amd64-box64-3"
 #elif defined(WINE_NX_BOX64_DYNAREC)
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-dynarec-223"
+#define WINE_NX_RUNTIME_BUILD "howdeploy-tb4-ru-dynarec-1"
 #else
-#define WINE_NX_RUNTIME_BUILD "nx-wow64-console-11"
+#define WINE_NX_RUNTIME_BUILD "howdeploy-tb4-ru-interpreter-1"
 #endif
 #define MAX_RUNTIME_MODULES 64
 #define MAX_IMPORT_DEPTH 16
@@ -273,6 +274,20 @@ static void stop_log_flusher( void )
  * exactly like the game hanging. A line that cannot be written is dropped and
  * counted instead. */
 static unsigned int log_lines_dropped;
+static size_t runtime_log_bytes, game_log_bytes;
+#define LOG_LIMIT (64u * 1024 * 1024)
+
+static void bounded_log_write( FILE *file, const char *text, size_t bytes, size_t *written )
+{
+    if (*written > LOG_LIMIT) return;
+    if (bytes > LOG_LIMIT - *written)
+    {
+        fputs( "[LOG] 64 MiB limit reached; remaining lines omitted\n", file );
+        *written = LOG_LIMIT + 1;
+        return;
+    }
+    *written += fwrite( text, 1, bytes, file );
+}
 
 static int log_lock_bounded( void )
 {
@@ -315,12 +330,17 @@ static void log_line( const char *fmt, ... )
         /* One write per line, so concurrent threads never interleave. */
         unsigned int dropped = __atomic_exchange_n( &log_lines_dropped, 0, __ATOMIC_RELAXED );
 
-        if (dropped) fprintf( log_file, "[LOG] %u lines dropped while the card was busy\n", dropped );
-        fwrite( line, 1, len, log_file );
+        if (dropped)
+        {
+            char message[96];
+            int bytes = snprintf( message, sizeof(message), "[LOG] %u lines dropped while the card was busy\n", dropped );
+            bounded_log_write( log_file, message, bytes, &runtime_log_bytes );
+        }
+        bounded_log_write( log_file, line, len, &runtime_log_bytes );
         if (!log_flusher_running || log_line_is_urgent( line )) fflush( log_file );
         if (game_log_file)
         {
-            fwrite( line, 1, len, game_log_file );
+            bounded_log_write( game_log_file, line, len, &game_log_bytes );
             if (!log_flusher_running || log_line_is_urgent( line )) fflush( game_log_file );
         }
         pthread_mutex_unlock( &log_mutex );
@@ -337,10 +357,13 @@ static int runtime_profile;
 
 static void open_game_log( const char *target )
 {
-    char path[512], name[128];
+    char path[512], name[128], stamp[32];
     const char *base = strrchr( target, '/' );
     FILE *sofar;
     size_t i, len;
+    uint32_t identity = 2166136261u;
+    time_t now = time( NULL );
+    struct tm calendar;
 
     if (!log_file) return;
     base = base ? base + 1 : target;
@@ -356,29 +379,35 @@ static void open_game_log( const char *target )
     }
     name[i] = 0;
     if ((len = strlen( name )) > 4 && !strcasecmp( name + len - 4, ".exe" )) name[len - 4] = 0;
-    /* Beside the runtime's own log, named after the program and the diagnostics
-     * the run had on, so a verbose or profiled run does not replace the plain
-     * one it is being compared with: Sims2EP9.log, Sims2EP9_verbose_profiler.log. */
-    snprintf( path, sizeof(path), "%s/%s%s%s.log", RUNTIME_LOGS, name,
+    /* Keep every session, including different games whose executable is Game.exe. */
+    for (i = 0; target[i]; i++) identity = (identity ^ (unsigned char)target[i]) * 16777619u;
+    if (localtime_r( &now, &calendar )) strftime( stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &calendar );
+    else strcpy( stamp, "unknown-time" );
+    snprintf( path, sizeof(path), "%s/%.64s-%08x-%s-%08x%s%s.log", RUNTIME_LOGS, name,
+              identity, stamp, (unsigned int)armGetSystemTick(),
               wine_nx_runtime_verbose ? "_verbose" : "", runtime_profile ? "_profiler" : "" );
 
     pthread_mutex_lock( &log_mutex );
     fflush( log_file );
     if ((game_log_file = fopen( path, "w" )))
     {
+        game_log_bytes = 0;
         /* What was said before this point, so the file stands on its own. */
         if ((sofar = fopen( RUNTIME_LOGS "/autorun_runtime.log", "r" )))
         {
             char chunk[4096];
             size_t got;
 
-            while ((got = fread( chunk, 1, sizeof(chunk), sofar )) > 0) fwrite( chunk, 1, got, game_log_file );
+            while ((got = fread( chunk, 1, sizeof(chunk), sofar )) > 0)
+                bounded_log_write( game_log_file, chunk, got, &game_log_bytes );
             fclose( sofar );
         }
         fflush( game_log_file );
     }
     pthread_mutex_unlock( &log_mutex );
     log_line( "[LOG] this run is kept in %s", path );
+    log_line( "[SESSION] target=%s id=%08x started=%s verbose=%d profiler=%d log_limit=64MiB",
+              target, identity, stamp, wine_nx_runtime_verbose, runtime_profile );
 }
 
 static void stall_watch( void *arg )

@@ -130,6 +130,7 @@ struct ui
     SDL_Event queued[32];
     int queued_count;
     int running;
+    int verbatim_text;  /* game titles, filenames and user-entered values */
 
     char toast[160];
     Uint32 toast_since, toast_until;
@@ -241,6 +242,7 @@ struct ui_row
     unsigned char value_tone;
     unsigned char on;   /* UI_ROW_SWITCH: which way it is set */
     unsigned char group;/* which section it belongs to */
+    unsigned char literal; /* keep user data unchanged */
 };
 
 struct ui_list

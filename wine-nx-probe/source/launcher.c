@@ -47,6 +47,9 @@
 #include "steamgriddb.h"
 #include "dxvk_releases.h"
 #include "box64_options.h"
+#include "launcher_i18n.h"
+#include "diagnostics.h"
+#define snprintf launcher_snprintf
 
 #define ICON_SIDE      128    /* icons are decoded no larger than this */
 #define ICON_TEXTURES  48     /* a screenful, the row below it and the backdrop, at 1 MiB each */
@@ -1136,9 +1139,11 @@ static void draw_card( struct launcher *l, int index, int x, int y, const struct
         ui_text( ui, ui->small, x + g->card - text_w - 18, y + g->card - 30, "Hidden", ui->dim );
     }
 
+    ui->verbatim_text = 1;
     text_w = ui_text_width( ui, ui->small, p->title );
     if (text_w > g->card + g->gap_x - 6) text_w = g->card + g->gap_x - 6;
     ui_text_fit( ui, ui->small, cx - text_w / 2, y + g->card + 8, g->card + g->gap_x - 6, p->title, caption, current );
+    ui->verbatim_text = 0;
 }
 
 static void draw_library( struct launcher *l )
@@ -1544,7 +1549,9 @@ static void draw_carousel_card( struct launcher *l, int index, SDL_Rect rect, fl
             SDL_RenderCopy( ui->renderer, p->icon, NULL, &dst );
         }
         else draw_placeholder( l, p, cx, cy - 5, target, shade );
+        ui->verbatim_text = 1;
         ui_text_wrapped( ui, ui->small, cx, y + h - 66, w - 24, 2, p->title, ui->text, 1 );
+        ui->verbatim_text = 0;
     }
     /* The gloss over the cover: brightest along its top edge, gone lower down. */
     if (focus > 0)
@@ -1655,8 +1662,10 @@ static void draw_home( struct launcher *l )
 
         title_x = focused_drawn ? focused_rect.x + focused_rect.w + HOME_FOCUS_GAP
                                 : SHELL_MARGIN + HOME_FOCUS_W + HOME_FOCUS_GAP;
+        ui->verbatim_text = 1;
         ui_text_fit( ui, ui->normal, title_x, HOME_TITLE_Y, ui->width - SHELL_MARGIN - title_x - 120, p->title,
                      ui->value, 1 );
+        ui->verbatim_text = 0;
         if (p->missing)
             draw_tag( ui, title_x, HOME_TITLE_Y + TTF_FontHeight( ui->normal ) + 20, "Missing", 1 );
 
@@ -1796,6 +1805,7 @@ static void download_artwork( struct launcher *l, struct program *p )
     for (i = 0; i < count; i++)
     {
         snprintf( rows[i].label, sizeof(rows[i].label), "%s", games[i].name );
+        rows[i].literal = 1;
         snprintf( rows[i].value, sizeof(rows[i].value), "SteamGridDB" );
         rows[i].help = "Download the highest-rated square, portrait and hero artwork for this match.";
     }
@@ -1835,7 +1845,7 @@ static void download_artwork( struct launcher *l, struct program *p )
 static const char *state_text( int state, int global, const char *on, const char *off, char *buffer, size_t size )
 {
     if (state >= 0) return state ? on : off;
-    snprintf( buffer, size, "Global (%s)", global ? on : off );
+    snprintf( buffer, size, "Global (%s)", launcher_tr(global ? on : off) );
     return buffer;
 }
 
@@ -2387,7 +2397,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
 #define ADD_ROW(i, section, text, help_text) \
         do { row = rows + count; memset( row, 0, sizeof(*row) ); ids[count++] = (i); \
              row->group = (section); row->kind = UI_ROW_ACTION; \
-             snprintf( row->label, sizeof(row->label), "%s", (text) ); row->help = (help_text); } while (0)
+             snprintf( row->label, sizeof(row->label), "%s", launcher_tr(text) ); row->help = launcher_tr(help_text); } while (0)
 
         ADD_ROW( ROW_START, SECTION_GENERAL, "Start", "Runs the game." );
         ADD_ROW( ROW_FAVORITE, SECTION_GENERAL, "Favorite", "Keeps the game in the Favorites filter of the library." );
@@ -2399,6 +2409,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
                  "The name shown in the library. Y goes back to the name in the program's own resources." );
         row->kind = UI_ROW_VALUE;
         snprintf( row->value, sizeof(row->value), "%s", p->title );
+        row->literal = 1;
 
         ADD_ROW( ROW_ARGS, SECTION_GENERAL, "Arguments",
                  "The command line after the program's name, kept beside it as NAME.args.txt. "
@@ -2410,6 +2421,7 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
         else if (read_line( path, global_line, sizeof(global_line) ) && launcher_args_match( global_line, p->dos ))
             snprintf( row->value, sizeof(row->value), "args.txt: %s", global_line );
         else snprintf( row->value, sizeof(row->value), "None" );
+        row->literal = 1;
 
         ADD_ROW( ROW_VERBOSE, SECTION_DIAGNOSTICS, "Verbose traces",
                  "Writes Wine's traces to autorun_runtime.log, which slows the program down. "
@@ -2441,8 +2453,8 @@ static int program_menu( struct launcher *l, struct program *p, char *target, si
             row->download = p->settings.dxvk && !dxvk_installed;
             snprintf( row->value, sizeof(row->value), "%s%s%s",
                       p->settings.dxvk ? "DXVK + VKD3D" : "Wine",
-                      p->settings.dxvk && !dxvk_installed ? " (download required)" : "",
-                      dxvk_beside ? " (app DLL first)" : "" );
+                      p->settings.dxvk && !dxvk_installed ? launcher_tr(" (download required)") : "",
+                      dxvk_beside ? launcher_tr(" (app DLL first)") : "" );
 
             ADD_ROW( ROW_VKD3D_VERSION, SECTION_GRAPHICS, "VKD3D version",
                      "Choose an official VKD3D GitHub release." );
@@ -2895,7 +2907,7 @@ enum settings_row
     SET_HIDDEN, SET_HIDE_MISSING, SET_DXVK_ON_ADD, SET_VERBOSE, SET_PROFILE, SET_WINDOWS, SET_SWKBD,
     SET_CONTROLS, SET_STEAMGRIDDB,
     SET_UPDATE, SET_REOPEN, SET_FORWARDER, SET_MAKE_32BIT, SET_MAKE_MAIN,
-    SET_CREDITS, SETTINGS_ROWS
+    SET_CREDITS, SET_LANGUAGE, SET_DIAGNOSTICS, SETTINGS_ROWS
 };
 
 /* Which forwarder to send a game to when this one cannot run it. The console
@@ -2928,7 +2940,7 @@ static void choose_forwarder( struct launcher *l )
         row->disabled = titles[i].id == l->options->title_id;
         if (row->disabled) snprintf( row->value, sizeof(row->value), "%s", "This forwarder" );
     }
-    if (ui_list_run( &l->ui, &list, "32-bit forwarder", "Installed applications", rows, count + 1, 1 ) ==
+    if (ui_list_run( &l->ui, &list, "32-bit forwarder", launcher_tr("Installed applications"), rows, count + 1, 1 ) ==
         UI_ACTION_CHOOSE)
     {
         chosen = list.selection;
@@ -2960,6 +2972,7 @@ static void save_look( struct launcher *l )
     launcher_kv_set( &l->look, "rows", NULL );
     launcher_kv_set( &l->look, "show-hidden", l->show_hidden ? "1" : "0" );
     launcher_kv_set( &l->look, "hide-missing", l->hide_missing ? "1" : NULL );
+    launcher_kv_set( &l->look, "language", launcher_language_code() );
     launcher_kv_set( &l->look, "browse", l->browse_dir );
     runtime_file( l, "launcher.txt", path, sizeof(path) );
     launcher_kv_save( &l->look, path );
@@ -3134,11 +3147,11 @@ static int key_screen( struct launcher *l, const char *control_label, unsigned s
         if (wine_nx_key_names[i].code)
             snprintf( rows[i].value, sizeof(rows[i].value), "0x%02x", wine_nx_key_names[i].code );
     }
-    snprintf( title, sizeof(title), "%s sends", control_label );
+    snprintf( title, sizeof(title), "%s sends", launcher_tr(control_label) );
     list.selection = at > 0 ? at : 0;
     for (;;)
     {
-        enum ui_action action = ui_list_run( &l->ui, &list, title, "Controls", rows,
+        enum ui_action action = ui_list_run( &l->ui, &list, title, launcher_tr("Controls"), rows,
                                              WINE_NX_KEY_NAME_COUNT, 0 );
 
         if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return -1;
@@ -3203,7 +3216,7 @@ static void controls_screen( struct launcher *l, const char *path, const char *u
         }
         rows[WINE_NX_DEVICE_COUNT_UI].help =
             "A and B are the mouse buttons until they are given a key of their own.";
-        action = ui_list_run( &l->ui, &list, title, "Controls", rows,
+        action = ui_list_run( &l->ui, &list, title, launcher_tr("Controls"), rows,
                               WINE_NX_DEVICE_COUNT_UI + WINE_NX_CONTROL_COUNT, 1 );
         if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) break;
         if (list.selection < WINE_NX_DEVICE_COUNT_UI)
@@ -3321,6 +3334,9 @@ static void settings_menu( struct launcher *l )
             [SET_FORWARDER] = SET_SECTION_SYSTEM, [SET_MAKE_32BIT] = SET_SECTION_SYSTEM,
             [SET_MAKE_MAIN] = SET_SECTION_SYSTEM,
             [SET_CREDITS] = SET_SECTION_SYSTEM,
+            [SET_SWKBD] = SET_SECTION_SYSTEM,
+            [SET_LANGUAGE] = SET_SECTION_SYSTEM,
+            [SET_DIAGNOSTICS] = SET_SECTION_SYSTEM,
         };
 
         memset( rows, 0, sizeof(rows) );
@@ -3393,7 +3409,7 @@ static void settings_menu( struct launcher *l )
                 snprintf( rows[SET_FORWARDER].value, sizeof(rows[0].value), "Not set" );
             else
                 snprintf( rows[SET_FORWARDER].value, sizeof(rows[0].value), "%s%s", name,
-                          installed ? "" : " (gone)" );
+                          installed ? "" : launcher_tr(" (gone)") );
         }
         rows[SET_FORWARDER].help = "The forwarder made with a 32-bit address space, for games that need the low "
                                    "4 GB. A game that needs it is offered to that forwarder, which the console "
@@ -3428,6 +3444,15 @@ static void settings_menu( struct launcher *l )
         rows[SET_CREDITS].help = "The projects and platform references used by Autorun.";
         rows[SET_CREDITS].adjustable = 0;
 
+        snprintf( rows[SET_LANGUAGE].label, sizeof(rows[0].label), "Language" );
+        snprintf( rows[SET_LANGUAGE].value, sizeof(rows[0].value), "%s",
+                  !strcmp( launcher_language_code(), "ru" ) ? "Русский" : "English" );
+        rows[SET_LANGUAGE].help = "Language changes immediately and is saved for the next launch.";
+        snprintf( rows[SET_DIAGNOSTICS].label, sizeof(rows[0].label), "Diagnostics" );
+        rows[SET_DIAGNOSTICS].kind = UI_ROW_ACTION;
+        rows[SET_DIAGNOSTICS].adjustable = 0;
+        rows[SET_DIAGNOSTICS].help = "Create a ZIP with logs and diagnostic settings. No game files, saves or raw settings are included.";
+
         action = ui_settings_run( ui, &list, "Settings", NULL, sections,
                                   sizeof(sections) / sizeof(sections[0]), rows, SETTINGS_ROWS, 0, &section );
         if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return;
@@ -3443,6 +3468,14 @@ static void settings_menu( struct launcher *l )
         switch (i)
         {
         case SET_HIDDEN: l->show_hidden = !l->show_hidden; break;
+        case SET_LANGUAGE:
+            launcher_set_language( !strcmp( launcher_language_code(), "ru" ) ? "en" : "ru" );
+            ui_start_screen( ui );
+            break;
+        case SET_DIAGNOSTICS:
+            if (action == UI_ACTION_CHOOSE) diagnostics_screen( ui, l->options );
+            ui_start_screen( ui );
+            break;
         case SET_HIDE_MISSING: l->hide_missing = !l->hide_missing; break;
         /* The runtime keeps these: it owns the settings file and writes every
          * one of them at once when the launcher closes. */
@@ -3511,7 +3544,7 @@ static void library_menu( struct launcher *l )
         rows[2].adjustable = 1;
         snprintf( rows[3].label, sizeof(rows[3].label), "Launcher settings" );
 
-        action = ui_list_run( &l->ui, &list, "Library", "Filter and sort", rows, 4, 1 );
+        action = ui_list_run( &l->ui, &list, "Library", launcher_tr("Filter and sort"), rows, 4, 1 );
         if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return;
         switch (list.selection)
         {
@@ -3634,7 +3667,7 @@ static int file_browser_storage( struct launcher *l, char *dir, size_t size )
         else
             snprintf( rows[1].value, sizeof(rows[1].value), "Not connected" );
 
-        action = ui_list_run( ui, &list, "Add Game", "Choose storage", rows, 2, 0 );
+        action = ui_list_run( ui, &list, "Add Game", launcher_tr("Choose storage"), rows, 2, 0 );
         if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return 0;
         if (action != UI_ACTION_CHOOSE) continue;
         if (!list.selection)
@@ -3669,7 +3702,7 @@ static int file_browser_storage( struct launcher *l, char *dir, size_t size )
                 snprintf( file_rows[i].label, sizeof(file_rows[i].label), "%s", mounted[i].label );
                 snprintf( file_rows[i].value, sizeof(file_rows[i].value), "%c:", mounted[i].drive );
             }
-            volume_action = ui_list_run( ui, &volumes, "USB", "Choose a volume", file_rows,
+            volume_action = ui_list_run( ui, &volumes, "USB", launcher_tr("Choose a volume"), file_rows,
                                          mounted_count, 0 );
             if (volume_action == UI_ACTION_QUIT) return 0;
             if (volume_action == UI_ACTION_BACK) continue;
@@ -3731,6 +3764,7 @@ static int file_browser_pick( struct launcher *l, char *target, size_t size )
 
                 memset( row, 0, sizeof(*row) );
                 snprintf( row->label, sizeof(row->label), "%s", files[i].name );
+                row->literal = 1;
                 if (files[i].is_dir) snprintf( row->value, sizeof(row->value), "Folder" );
                 else if (!files[i].supported)
                 {
@@ -4229,6 +4263,11 @@ int wine_nx_launcher_run( struct wine_nx_launcher_options *options, char *target
     launcher_kv_load( &l->look, path );
     l->show_hidden = launcher_kv_get_int( &l->look, "show-hidden", 0 ) == 1;
     l->hide_missing = launcher_kv_get_int( &l->look, "hide-missing", 0 ) == 1;
+    {
+        char language[16] = "";
+        launcher_kv_get( &l->look, "language", language, sizeof(language) );
+        launcher_set_language( language );
+    }
     if (!launcher_kv_get( &l->look, "browse", l->browse_dir, sizeof(l->browse_dir) ) || !l->browse_dir[0])
         snprintf( l->browse_dir, sizeof(l->browse_dir), "%s", LAUNCHER_DRIVE_C );
 

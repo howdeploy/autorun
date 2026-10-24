@@ -604,6 +604,8 @@ add_executable(wine-nx-runtime
     source/runtime.c
     "${CMAKE_CURRENT_BINARY_DIR}/forwarder_embed.c"
     source/launcher.c
+    source/launcher_i18n.c
+    source/diagnostics.c
     source/launcher_catalog.c
     source/launcher_console.c
     source/launcher_svg.c
@@ -894,7 +896,7 @@ endif()
 # functions come through eglGetProcAddress, so it works over either Mesa.
 find_library(SWITCH_SDL2 SDL2 HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
 find_library(SWITCH_SDL2_TTF SDL2_ttf HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
-set_source_files_properties(source/launcher.c source/launcher_catalog.c source/launcher_ui.c source/launcher_update.c source/steamgriddb.c source/dxvk_releases.c source/osk.c PROPERTIES
+set_source_files_properties(source/launcher.c source/launcher_catalog.c source/launcher_ui.c source/launcher_update.c source/diagnostics.c source/steamgriddb.c source/dxvk_releases.c source/osk.c PROPERTIES
     INCLUDE_DIRECTORIES "$ENV{DEVKITPRO}/portlibs/switch/include/SDL2"
     COMPILE_DEFINITIONS _REENTRANT)
 set_property(SOURCE source/launcher_update.c APPEND PROPERTY COMPILE_DEFINITIONS WINE_NX_BUILD_VERSION)
@@ -1032,9 +1034,14 @@ if(NACPTOOL AND ELF2NRO)
 
     add_custom_target(wine-nx-ntdll-file-smoke-nro ALL DEPENDS "${NTDLL_FILE_SMOKE_NRO_FILE}")
 
+    if(WINE_NX_BOX64_DYNAREC)
+        set(AUTORUN_NACP_NAME "Autorun RU DynaRec")
+    else()
+        set(AUTORUN_NACP_NAME "Autorun RU Interpreter")
+    endif()
     add_custom_command(
         OUTPUT "${RUNTIME_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "Autorun" "ticoverse.com" "0.0.1" "${RUNTIME_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "${AUTORUN_NACP_NAME}" "howdeploy + Autorun contributors" "TB4 RU1" "${RUNTIME_NACP_FILE}"
         VERBATIM
     )
 

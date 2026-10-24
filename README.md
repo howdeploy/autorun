@@ -4,6 +4,13 @@
 
 <h1 align="center">Autorun</h1>
 
+> **howdeploy fork: Russian UI and Wi-Fi diagnostics.** Based on upstream
+> `test-build-4`. See [fork usage and build notes](documentation/ru-diagnostics.md).
+> Fork binaries are experimental OpenGL builds, supplied as additional NRO files
+> for an existing TB4 installation. Upstream compatibility results below do not
+> establish compatibility of these binaries. No console or runtime tests have
+> been performed for this fork.
+
 <p align="center">
   Play Windows PC games on your Nintendo Switch.<br>
   <sub>Previously called Wine-NX.</sub>

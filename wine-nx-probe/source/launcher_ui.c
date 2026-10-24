@@ -12,6 +12,8 @@
 
 #include "launcher_svg.h"
 #include "launcher_ui.h"
+#include "launcher_i18n.h"
+#define snprintf launcher_snprintf
 
 #define FADE_MS          160
 #define REPEAT_DELAY_MS  360
@@ -571,6 +573,7 @@ int ui_text_width( struct ui *ui, TTF_Font *font, const char *text )
     struct ui_text_entry *entry;
     int w = 0, h;
 
+    if (!ui->verbatim_text) text = launcher_tr( text );
     if (!text[0]) return 0;
     if ((entry = text_entry( ui, font, text, ui->text, 1 ))) return entry->width;
     TTF_SizeUTF8( font, text, &w, &h );
@@ -582,6 +585,7 @@ void ui_text( struct ui *ui, TTF_Font *font, int x, int y, const char *text, SDL
     struct ui_text_entry *entry;
     SDL_Surface *surface;
 
+    if (!ui->verbatim_text) text = launcher_tr( text );
     if (!text[0]) return;
     if ((entry = text_entry( ui, font, text, color, 0 )))
     {
@@ -610,6 +614,7 @@ void ui_text_opening( struct ui *ui, TTF_Font *font, int x, int y, const char *t
     SDL_Rect clip, dst, previous;
     SDL_bool clipped;
 
+    if (!ui->verbatim_text) text = launcher_tr( text );
     if (open <= 0.01f || !text[0]) return;
     if (open >= 0.99f || !(entry = text_entry( ui, font, text, color, 0 )))
     {
@@ -664,10 +669,12 @@ static const char *ellipsis( TTF_Font *font )
 void ui_text_fit( struct ui *ui, TTF_Font *font, int x, int y, int max_width, const char *text,
                   SDL_Color color, int scroll )
 {
-    int width = ui_text_width( ui, font, text );
+    int width;
     char cut[UI_TEXT_KEY];
     size_t bytes;
 
+    if (!ui->verbatim_text) text = launcher_tr( text );
+    width = ui_text_width( ui, font, text );
     if (width <= max_width)
     {
         ui_text( ui, font, x, y, text, color );
@@ -687,6 +694,7 @@ void ui_text_fit( struct ui *ui, TTF_Font *font, int x, int y, int max_width, co
     }
     bytes = fitting_bytes( font, text, max_width - ui_text_width( ui, font, ellipsis( font ) ) );
     if (bytes > sizeof(cut) - 4) bytes = sizeof(cut) - 4;
+    while (bytes && ((unsigned char)text[bytes] & 0xc0) == 0x80) bytes--;
     while (bytes && text[bytes - 1] == ' ') bytes--;
     memcpy( cut, text, bytes );
     strcpy( cut + bytes, ellipsis( font ) );
@@ -701,12 +709,14 @@ static int wrap_text( struct ui *ui, TTF_Font *font, int x, int y, int max_width
     int lines = 0, line_height = TTF_FontHeight( font ) + 4;
     char line[UI_TEXT_KEY];
 
+    if (!ui->verbatim_text) text = launcher_tr( text );
     while (*text && lines < max_lines)
     {
         const char *newline = strchr( text, '\n' );
         size_t len = newline ? (size_t)(newline - text) : strlen( text ), bytes;
 
         if (len >= sizeof(line)) len = sizeof(line) - 1;
+        while (len && ((unsigned char)text[len] & 0xc0) == 0x80) len--;
         memcpy( line, text, len );
         line[len] = 0;
         bytes = fitting_bytes( font, line, max_width );
@@ -762,11 +772,14 @@ void ui_header( struct ui *ui, const char *title, const char *context )
     title_right = ui->width / 2 + ui_text_width( ui, ui->large, title ) / 2;
     if (context && context[0])
     {
-        int max_width = ui->width - 28 - title_right - 30, width = ui_text_width( ui, ui->small, context );
+        int max_width = ui->width - 28 - title_right - 30, width;
+        ui->verbatim_text = 1;
+        width = ui_text_width( ui, ui->small, context );
 
         if (max_width > 40)
             ui_text_fit( ui, ui->small, ui->width - 28 - (width < max_width ? width : max_width),
                          (band - TTF_FontHeight( ui->small )) / 2, max_width, context, ui->dim, 1 );
+        ui->verbatim_text = 0;
     }
 }
 
@@ -797,8 +810,10 @@ void ui_header_back( struct ui *ui, const char *title, const char *context )
     {
         int room = ui->width - 300 - x;
 
+        ui->verbatim_text = 1;
         if (room > 60)
             ui_text_fit( ui, ui->small, x, cy - TTF_FontHeight( ui->small ) / 2, room, context, ui->dim, 0 );
+        ui->verbatim_text = 0;
     }
     ui->status_left = ui->width;
     if (ui->header_status) ui->header_status( ui->header_status_data, ui->width - UI_HEADER_MARGIN, cy );
@@ -1698,6 +1713,7 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
             int text_y = y + (ROW_HEIGHT - TTF_FontHeight( ui->normal )) / 2;
             int icon_w = rows[i].download ? 30 : 0;
             int disclosure_w = rows[i].kind == UI_ROW_DROPDOWN ? 28 : 0;
+            ui->verbatim_text = rows[i].literal;
             int value_w = rows[i].value[0] ? ui_text_width( ui, ui->small, rows[i].value ) : 0;
             int value_max = value_w < column_w / 3 ? value_w : column_w / 3;
             int label_w = value_right - ROW_PADDING - column_x - icon_w - disclosure_w -
@@ -1726,6 +1742,7 @@ enum ui_action ui_list_run( struct ui *ui, struct ui_list *list, const char *tit
                 else ui_chevron_down( ui, value_right - 18, y + (ROW_HEIGHT - 9) / 2, arrow );
             }
         }
+        ui->verbatim_text = 0;
         SDL_RenderSetClipRect( ui->renderer, NULL );
         if (count > visible)
         {
@@ -1904,6 +1921,7 @@ int ui_settings_dropdown( struct ui *ui, const struct ui_list *anchor,
                 int row_y = y + padding + (i - top) * row_h;
                 int current = i == selection;
                 int icon_w = rows[i].download ? 28 : 0;
+                ui->verbatim_text = rows[i].literal;
                 int value_w = rows[i].value[0] ? ui_text_width( ui, ui->small, rows[i].value ) : 0;
 
                 if (value_w > panel_w / 3) value_w = panel_w / 3;
@@ -1923,6 +1941,7 @@ int ui_settings_dropdown( struct ui *ui, const struct ui_list *anchor,
                                       current ? ui->value : ui->dim );
             }
         }
+        ui->verbatim_text = 0;
         SDL_RenderSetClipRect( ui->renderer, NULL );
         if (count > visible)
         {
@@ -2161,6 +2180,7 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
             int current = i == list->selection, middle = box_y + box_h / 2;
             int control_w = r->kind == UI_ROW_SWITCH ? 92 :
                             r->kind == UI_ROW_INFO ? 0 : 44 + (r->download ? 28 : 0);
+            ui->verbatim_text = r->literal;
             int value_w = r->value[0] ? ui_text_width( ui, ui->small, r->value ) : 0;
             int label_w, right, label_h, help_lines, block_h, text_y;
             SDL_Color color = r->disabled ? ui->dim : r->destructive ? ui->danger : current ? ui->value : ui->text;
@@ -2227,6 +2247,7 @@ enum ui_action ui_settings_run( struct ui *ui, struct ui_list *list, const char 
                 break;
             }
         }
+        ui->verbatim_text = 0;
         if (shown > visible)
         {
             int track_h = visible * SET_ROW_H - 12, thumb = track_h * visible / shown;

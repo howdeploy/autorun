@@ -110,7 +110,7 @@ static const struct wine_nx_key_name wine_nx_key_names[] =
     { 0x70, "F1" },  { 0x71, "F2" },  { 0x72, "F3" },  { 0x73, "F4" },
     { 0x74, "F5" },  { 0x75, "F6" },  { 0x76, "F7" },  { 0x77, "F8" },
     { 0x78, "F9" },  { 0x79, "F10" }, { 0x7a, "F11" }, { 0x7b, "F12" },
-    { 0x2d, "Insert" },   { 0x2e, "Delete" },    { 0x24, "Home" },
+    { 0x2d, "Insert" },   { 0x2e, "Delete" },    { 0x24, "Home key" },
     { 0x23, "End" },      { 0x21, "Page up" },   { 0x22, "Page down" },
     { 0x14, "Caps lock" }, { 0x2c, "Print screen" }, { 0x13, "Pause" },
     { 0x60, "Numpad 0" }, { 0x61, "Numpad 1" }, { 0x62, "Numpad 2" },
