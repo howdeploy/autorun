@@ -194,6 +194,14 @@ The reported console stall remains unverified until a fresh game trial.
 `horizon-wine/check-audio.sh` tests the separate audout backend and is not a
 substitute for these DLL checks.
 
+The verified x86 audio bundle was installed over Autorun FTP on 2026-10-28 at
+15:44 MSK. Both system syswow64 DLLs were staged, downloaded for SHA-256
+verification, activated and read back again. Previous versions remain beside
+them with the suffix `.before-fnv-audio-20261028-154410`, and are also backed up
+on the PC. The upstream DLL manifest and the per-game verbose=0 setting were
+verified unchanged; the local patch provenance record was updated. Restart the
+Autorun process before the console trial so the new DLLs are loaded.
+
 ## First comparison, when console testing is requested
 
 Start with FEX and DXVK, frame generation off, verbose traces off, the Low
