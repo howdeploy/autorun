@@ -1601,6 +1601,28 @@ static HRESULT test_invalid_fmts(LPGUID lpGuid)
     return S_OK;
 }
 
+static DWORD WINAPI replace_notifications(void *arg)
+{
+    IDirectSoundNotify *notify = arg;
+    DSBPOSITIONNOTIFY positions[2] = {{22050, NULL}, {0, NULL}};
+    HRESULT hr;
+    unsigned int i;
+
+    positions[0].hEventNotify = positions[1].hEventNotify = CreateEventW(NULL, FALSE, FALSE, NULL);
+    ok(!!positions[0].hEventNotify, "Failed to create notification event, error %lu.\n", GetLastError());
+    if (!positions[0].hEventNotify) return 0;
+    for (i = 0; i < 2000; ++i)
+    {
+        hr = IDirectSoundNotify_SetNotificationPositions(notify, 2, positions);
+        ok(hr == DS_OK || hr == DSERR_INVALIDCALL, "Got hr %#lx.\n", hr);
+        hr = IDirectSoundNotify_SetNotificationPositions(notify, 0, NULL);
+        ok(hr == DS_OK || hr == DSERR_INVALIDCALL, "Got hr %#lx.\n", hr);
+        if (!(i % 32)) Sleep(1);
+    }
+    CloseHandle(positions[0].hEventNotify);
+    return 0;
+}
+
 static void test_notifications(LPGUID lpGuid)
 {
     HRESULT rc;
@@ -1612,6 +1634,7 @@ static void test_notifications(LPGUID lpGuid)
     DSBPOSITIONNOTIFY notifies[2];
     HANDLE handles[2];
     DWORD expect, status;
+    HANDLE thread;
     int cycles;
 
     rc = DirectSoundCreate(lpGuid, &dso, NULL);
@@ -1668,8 +1691,6 @@ static void test_notifications(LPGUID lpGuid)
     rc = IDirectSoundNotify_SetNotificationPositions(buf_notif, 2, notifies);
     ok(rc == DS_OK, "SetNotificationPositions: %08lx\n", rc);
 
-    IDirectSoundNotify_Release(buf_notif);
-
     rc = IDirectSoundBuffer_Play(buf, 0, 0, DSBPLAY_LOOPING);
     ok(rc == DS_OK, "Play: %08lx\n", rc);
 
@@ -1687,6 +1708,15 @@ static void test_notifications(LPGUID lpGuid)
 
         expect = !expect;
     }
+
+    thread = CreateThread(NULL, 0, replace_notifications, buf_notif, 0, NULL);
+    ok(!!thread, "Failed to create notification worker, error %lu.\n", GetLastError());
+    if (thread)
+    {
+        WaitForSingleObject(thread, INFINITE);
+        CloseHandle(thread);
+    }
+    IDirectSoundNotify_Release(buf_notif);
 
     rc = IDirectSoundBuffer_Stop(buf);
     ok(rc == DS_OK, "Stop: %08lx\n", rc);

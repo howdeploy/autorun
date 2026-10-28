@@ -106,11 +106,12 @@ replacing only the runtime NRO cannot install it. The installed DLL manifest
 still describes the pinned upstream payload. Any console trial needs the
 rebuilt x86 Quartz DLL and a retained original, without silently overwriting
 that manifest. The x86 Quartz DLL has been cross-compiled with the pinned LLVM
-toolchain; its 186 named imports resolve against the pinned 14 i386 dependency
-modules. A local installation keeps its provenance in
+toolchain. The current audio bundle resolves Quartz's 187 named imports against
+14 i386 dependency modules, and DirectSound's 82 imports against five modules.
+A local installation keeps its provenance in
 `horizon-dlls/local-falloutnv-mp3.json`, separately from the upstream manifest;
-a subsequent Windows DLL update can replace the local fix. Automated tests
-and a console trial of this change have not been run. Verbose traces were
+a subsequent Windows DLL update can replace the local fix. The 14:29 console
+trial and subsequent host API tests are described below. Verbose traces were
 enabled in the captured session, which
 reached the 64 MiB log limit; use a separate trace-disabled comparison before
 drawing performance conclusions.
@@ -162,16 +163,36 @@ header. Non-PCM formats still require the full header and their declared extra
 bytes. This matches the existing DirectSound format copier and the Windows
 [PCM cbSize convention](https://learn.microsoft.com/en-us/windows/win32/api/mmreg/ns-mmreg-waveformatex).
 
-These follow-up source changes have not been built, tested or installed on the
-console. They are not yet evidence that the reported FEX/audio stall is fixed.
-The upstream main head was checked through Git and remains `1ac9b6cf`.
+The follow-up x86 DLLs were cross-compiled with the pinned LLVM toolchain and
+their named imports checked against the pinned runtime modules. The upstream
+main head was checked through Git and remains `1ac9b6cf`.
 
-Pending verification includes the existing `quartz:dsoundrender` flushing and
-EOS scenarios and `dsound:dsound` notification scenarios. Those sequential
-tests alone do not cover concurrent notification replacement or allocation
-failures; the new failure paths also need targeted coverage. The host
-`horizon-wine/check-audio.sh` exercises the audout backend, not the changed
-DirectSound/quartz DLL code, so passing it alone cannot validate these changes.
+Host checks under Wine 11.17, in an isolated prefix with a temporary silent audio
+sink, cover the actual new DLL code:
+
+- `quartz:dsoundrender`: 1004 checks, no failures or skips; 15 existing expected
+  failures remain marked todo. Connection, flushing and EOS tests run with
+  both the short PCM and full WAVEFORMATEX headers. The fixed EOS-during-flush
+  expectation is now a normal assertion.
+- `dsound:dsound`: 30074 checks, no failures or skips; 76 existing expected
+  failures remain marked todo. A worker repeatedly replaces and clears the
+  notification array while the mixer is playing.
+- [Mixer allocation regression](../horizon-wine/tests/dsound_mixer.c): the real
+  mixer implementation handles zero input and forced realloc failures while
+  retaining old allocations, emitting silence and advancing the resampler phase.
+- [Native MP3 graph regression](../horizon-wine/tests/native_mp3_graph.c): the
+  user's GOG MainTitle.mp3 reports 125.352 seconds and completes three short
+  segments, including seek after EOS and a stop/restart. GStreamer is disabled
+  so the graph uses the native splitter; the game itself is not launched.
+
+Only the DOS-header builtin marker of the host-test DLL copies is changed so
+Linux Wine will load them as native modules; the installed payload retains the
+original marker. Code and other payload bytes are identical. These host tests
+do not exercise Horizon/FEX, NVK or the Horizon FFmpeg decoder bridge. Allocator
+commit and thread-creation failures have been reviewed but not fault-injected.
+The reported console stall remains unverified until a fresh game trial.
+`horizon-wine/check-audio.sh` tests the separate audout backend and is not a
+substitute for these DLL checks.
 
 ## First comparison, when console testing is requested
 
@@ -204,6 +225,6 @@ diagnostics can change performance. Test sound, controls and save/load too.
 The FEX/DXVK/VKD3D runtime was cross-compiled in the pinned switch-dev image
 on 2026-10-28 while preparing its installation. The Linux package verifier
 uses the same `WINE_NX_LLVM_MINGW` toolchain as the build. Existing upstream
-tests are retained; automated test suites, UI checks and console game launches
-have not been run by the agent. Interactive gameplay and performance remain
-unverified.
+tests are retained; the targeted host DLL checks above have been run. UI checks
+and console game launches have not been run by the agent. Interactive gameplay
+and performance remain unverified.

@@ -1167,7 +1167,7 @@ static void test_eos(IPin *pin, IMemInputPin *input, IMediaSeeking *seeking, IMe
     ret = check_ec_complete(eventsrc, 0);
     ok(!ret, "Got unexpected EC_COMPLETE.\n");
     hr = IPin_EndOfStream(pin);
-    todo_wine ok(hr == S_FALSE, "Got hr %#lx.\n", hr);
+    ok(hr == S_FALSE, "Got hr %#lx.\n", hr);
     ret = check_ec_complete(eventsrc, 0);
     ok(!ret, "Got unexpected EC_COMPLETE.\n");
     hr = IPin_EndFlush(pin);
@@ -1230,7 +1230,7 @@ static void test_eos(IPin *pin, IMemInputPin *input, IMediaSeeking *seeking, IMe
     IMediaEvent_Release(eventsrc);
 }
 
-static void test_connect_pin(void)
+static void test_connect_pin(DWORD format_size)
 {
     ALLOCATOR_PROPERTIES req_props = {1, 4 * 44100, 1, 0}, ret_props;
     WAVEFORMATEX wfx =
@@ -1247,7 +1247,7 @@ static void test_connect_pin(void)
         .majortype = MEDIATYPE_Audio,
         .subtype = MEDIASUBTYPE_PCM,
         .formattype = FORMAT_WaveFormatEx,
-        .cbFormat = sizeof(wfx),
+        .cbFormat = format_size,
         .pbFormat = (BYTE *)&wfx,
     };
     IBaseFilter *filter = create_dsound_render();
@@ -1623,7 +1623,8 @@ START_TEST(dsoundrender)
     test_enum_media_types();
     test_unconnected_filter_state();
     test_media_types();
-    test_connect_pin();
+    test_connect_pin(sizeof(WAVEFORMATEX));
+    test_connect_pin(sizeof(PCMWAVEFORMAT));
     test_unconnected_eos();
 
     CoUninitialize();
