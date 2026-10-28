@@ -14,7 +14,7 @@
  *
  * Build (see check-launcher-host.sh):
  *   clang -std=gnu11 -I source $(sdl2-config --cflags) tests/launcher_host.c source/launcher.c
- *     source/launcher_ui.c $(sdl2-config --libs) -lSDL2_ttf -lpng
+ *     source/launcher_ui.c source/launcher_i18n.c $(sdl2-config --libs) -lSDL2_ttf -lpng
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +32,8 @@
 #include "launcher_update.h"
 #include "launcher_dlls.h"
 #include "launcher_fixes.h"
+#include "diagnostics.h"
+#include "ftp_server.h"
 #include "forwarder.h"
 #include "launcher_image.h"
 #include "dxvk_releases.h"
@@ -42,6 +44,12 @@ static char prompt_text[512];
 static int prompt_set;
 static const char *font_path;
 static unsigned char *font_data;
+
+/* The scripted host fixture does not start file-transfer or report screens. */
+int diagnostics_screen( struct ui *ui, struct wine_nx_launcher_options *options )
+{ (void)ui; (void)options; return 0; }
+int ftp_server_screen( struct ui *ui, struct wine_nx_launcher_options *options )
+{ (void)ui; (void)options; return 0; }
 
 struct launcher_update *launcher_update_create( struct ui *ui, const char *root, int (*restart)(void) )
 {

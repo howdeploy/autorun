@@ -2429,7 +2429,7 @@ static int program_menu_run( struct launcher *l, struct program *p, char *target
 #define ADD_ROW(i, section, text, help_text) \
         do { row = rows + count; memset( row, 0, sizeof(*row) ); ids[count++] = (i); \
              row->group = (section); row->kind = UI_ROW_ACTION; \
-             snprintf( row->label, sizeof(row->label), "%s", (text) ); row->help = (help_text); } while (0)
+             snprintf( row->label, sizeof(row->label), "%s", launcher_tr(text) ); row->help = launcher_tr(help_text); } while (0)
 
         ADD_ROW( ROW_START, SECTION_GENERAL, "Start", "Runs the game." );
         {
@@ -2464,6 +2464,8 @@ static int program_menu_run( struct launcher *l, struct program *p, char *target
         else if (read_line( path, global_line, sizeof(global_line) ) && launcher_args_match( global_line, p->dos ))
             snprintf( row->value, sizeof(row->value), "args.txt: %s", global_line );
         else snprintf( row->value, sizeof(row->value), "None" );
+
+        row->literal = 1;
 
 #ifdef WINE_NX_FEX
         if (x86 || x64)

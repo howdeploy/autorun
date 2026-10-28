@@ -17,9 +17,23 @@ This is a source integration, not a measured FPS improvement or a tested NRO.
 - SD caching, opt-in loading of mapped files on demand, shader-worker affinity,
   multichannel audio and the current DirectShow/component setup.
 
+Two reviewed community changes are also backported with their original authors
+and source commit IDs:
+
+- [PR #86](https://github.com/autorunhq/autorun/pull/86): tags queued file
+  descriptors with their client, avoiding another thread's channel when the
+  matching descriptor is queued.
+- [PR #90](https://github.com/autorunhq/autorun/pull/90): reclaims already-ended
+  threads and waits up to 20 seconds for a free thread slot instead of failing
+  immediately. The wait happens outside the memory-mapping lock and stops on
+  shutdown. It does not raise the system's 96-thread limit; a permanent lack
+  of slots can still fail. These PRs were open when imported, not upstream
+  release guarantees or New Vegas performance measurements.
+
 The fork retains Russian UI, authenticated FTP, independent session logs, a
 bounded event log and downloadable diagnostic ZIPs. Windows NUL and local
 keyboard/mouse hook support are carried forward to the new Wine protocol.
+The New Vegas profile's setting labels and quality presets are translated.
 
 ## Build preparation
 
