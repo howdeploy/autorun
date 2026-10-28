@@ -4027,7 +4027,7 @@ int main( int argc, char **argv )
     {
         setvbuf( log_file, log_file_buffer, _IOFBF, sizeof(log_file_buffer) );
         strcpy( event_log_path, RUNTIME_LOGS "/autorun_events.log" );
-        snprintf( event_log_header, sizeof(event_log_header), "[BUILD] %s howdeploy/main-nv1\n", WINE_NX_RUNTIME_BUILD );
+        snprintf( event_log_header, sizeof(event_log_header), "[BUILD] %s howdeploy/main-mkxp1\n", WINE_NX_RUNTIME_BUILD );
         event_log_file = fopen( event_log_path, "w" );
         event_log_bytes = event_log_file ? fwrite( event_log_header, 1, strlen(event_log_header), event_log_file ) : 0;
         log_flusher_running = !pthread_create( &log_flusher_thread, NULL, log_flusher, NULL );
@@ -4223,7 +4223,7 @@ int main( int argc, char **argv )
         {
             .runtime_dir = RUNTIME_DIR,
             .emummc = runtime_on_emummc(),
-            .build = WINE_NX_RUNTIME_BUILD " howdeploy/main-nv1",
+            .build = WINE_NX_RUNTIME_BUILD " howdeploy/main-mkxp1",
             .sync_settings = launcher_sync_settings,
             .machine_of = launcher_machine,
 #ifdef WINE_NX_USB_STORAGE
@@ -4457,7 +4457,7 @@ int main( int argc, char **argv )
     horizon_server_profile_enabled = runtime_profile;
     open_game_log( target );
     log_line( "wine-nx-runtime: generic Wine ntdll PE loader path" );
-    log_line( "[BUILD] %s howdeploy/main-nv1", WINE_NX_RUNTIME_BUILD );
+    log_line( "[BUILD] %s howdeploy/main-mkxp1", WINE_NX_RUNTIME_BUILD );
     runtime_boost_thread_limit();
     log_line( "[SYNC] %s", horizon_fast_sync_enabled ? "Horizon queued waits" : "Standard" );
     wine_nx_thread_configure_cores( runtime_four_cores );
