@@ -290,7 +290,15 @@ The 49-file bundle, per-game settings and two-step setup queue were uploaded
 and SHA-256 readback verified over Autorun FTP on 2026-10-28. The original
 settings and pre-registration registry are backed up on the PC. System
 Quartz, DirectSound and the upstream DLL manifest were verified unchanged.
-Registration is pending the user's next restart; gameplay remains unverified.
+After the user's restart, the 17:39:59 enable session reports a successful
+registry edit and exit code 0. FTP readback confirms the per-game
+`dsound=native` value. The 17:40:02 registration session reports successful
+registration of LAVSplitter.ax, LAVAudio.ax and LAVVideo.ax, then exits with
+code 0. The persisted registry contains the LAV classes, and `run-next.txt`
+is absent. FEX/Sarek 1.14.1, 30 FPS, VSync and disabled frame generation remain
+in the game's settings. This verifies setup completion on Horizon, not that
+New Vegas has loaded DSOAL or reached an interactive menu. Gameplay remains
+unverified.
 
 Start with FEX and DXVK, frame generation off, verbose traces off, the Low
 preset, anti-aliasing off and 1280x720. These are proposed comparison settings,
