@@ -98,6 +98,21 @@ static REFERENCE_TIME time_from_pos(struct dsound_render *filter, DWORD pos)
     return ret;
 }
 
+static bool valid_audio_format(const AM_MEDIA_TYPE *mt)
+{
+    const WAVEFORMATEX *format = (const WAVEFORMATEX *)mt->pbFormat;
+
+    if (!IsEqualGUID(&mt->majortype, &MEDIATYPE_Audio)
+            || !IsEqualGUID(&mt->formattype, &FORMAT_WaveFormatEx)
+            || !format || mt->cbFormat < sizeof(PCMWAVEFORMAT)
+            || !format->nSamplesPerSec || !format->nAvgBytesPerSec)
+        return false;
+    /* PCM may use the shorter header without cbSize. */
+    return format->wFormatTag == WAVE_FORMAT_PCM
+            || (mt->cbFormat >= sizeof(*format)
+                && format->cbSize <= mt->cbFormat - sizeof(*format));
+}
+
 static DWORD pos_from_time(struct dsound_render *filter, REFERENCE_TIME time)
 {
     WAVEFORMATEX *wfx = (WAVEFORMATEX *)filter->sink.pin.mt.pbFormat;
@@ -318,24 +333,20 @@ static HRESULT configure_buffer(struct dsound_render *filter, IMediaSample *pSam
         WAVEFORMATEX *newfmt = (WAVEFORMATEX *)amt->pbFormat;
 
         TRACE("Format change.\n");
-        if (!IsEqualGUID(&amt->majortype, &MEDIATYPE_Audio)
-                || !IsEqualGUID(&amt->formattype, &FORMAT_WaveFormatEx)
-                || !newfmt || amt->cbFormat < sizeof(*newfmt)
-                || !newfmt->nSamplesPerSec || !newfmt->nAvgBytesPerSec
-                || (newfmt->wFormatTag != WAVE_FORMAT_PCM
-                    && newfmt->cbSize > amt->cbFormat - sizeof(*newfmt)))
+        if (!valid_audio_format(amt))
         {
             hr = VFW_E_TYPE_NOT_ACCEPTED;
             goto done;
         }
-        if (newfmt->cbSize <= amt->cbFormat - sizeof(*newfmt))
+        if (amt->cbFormat >= sizeof(*newfmt)
+                && newfmt->cbSize <= amt->cbFormat - sizeof(*newfmt))
             strmbase_dump_media_type(amt);
 
         if (origfmt->wFormatTag == newfmt->wFormatTag &&
             origfmt->nChannels == newfmt->nChannels &&
             origfmt->nBlockAlign == newfmt->nBlockAlign &&
             origfmt->wBitsPerSample == newfmt->wBitsPerSample &&
-            origfmt->cbSize ==  newfmt->cbSize)
+            (newfmt->wFormatTag == WAVE_FORMAT_PCM || origfmt->cbSize == newfmt->cbSize))
         {
             if (origfmt->nSamplesPerSec != newfmt->nSamplesPerSec)
             {
@@ -545,10 +556,7 @@ static HRESULT dsound_render_sink_connect(struct strmbase_sink *iface, IPin *pee
     HRESULT hr = S_OK;
     DSBUFFERDESC buf_desc;
 
-    if (!IsEqualGUID(&mt->formattype, &FORMAT_WaveFormatEx)
-            || !format || mt->cbFormat < sizeof(*format)
-            || (format->wFormatTag != WAVE_FORMAT_PCM
-                && format->cbSize > mt->cbFormat - sizeof(*format)))
+    if (!valid_audio_format(mt))
         return VFW_E_TYPE_NOT_ACCEPTED;
 
     filter->buf_size = format->nAvgBytesPerSec;

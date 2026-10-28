@@ -156,6 +156,12 @@ The audio-path source review fixes these independent defects together:
   uninitialized values into rendering. Resetting 8-bit PCM uses unsigned silence
   (0x80).
 
+Audio format validation keeps both the 16-byte PCMWAVEFORMAT and the 18-byte
+WAVEFORMATEX form of PCM. It never reads or compares cbSize for the short PCM
+header. Non-PCM formats still require the full header and their declared extra
+bytes. This matches the existing DirectSound format copier and the Windows
+[PCM cbSize convention](https://learn.microsoft.com/en-us/windows/win32/api/mmreg/ns-mmreg-waveformatex).
+
 These follow-up source changes have not been built, tested or installed on the
 console. They are not yet evidence that the reported FEX/audio stall is fixed.
 The upstream main head was checked through Git and remains `1ac9b6cf`.
