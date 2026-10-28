@@ -143,10 +143,29 @@ The audio-path source review fixes these independent defects together:
 - DirectSound skips empty sample reads before circular-buffer arithmetic,
   preserves scratch allocations when realloc fails, and uses silence instead
   of dereferencing a failed allocation or mixing stale temporary data.
+- The DirectShow audio renderer now joins its old worker and releases queued
+  samples on flush before resetting EOS and starting a new worker. Previously
+  the replacement worker could observe the old EOS flag and exit immediately,
+  or keep playing pre-seek samples. Stop uses the same worker cleanup; destroying
+  the renderer also frees the queue allocation. EOS received during a flush is
+  rejected, and pending completion is suppressed when flushing.
+- Dynamic audio formats are freed after inspection and copied before replacing
+  the current format, so failed allocations leave the current format intact.
+  Truncated format blocks and invalid sample lengths are rejected. Failed
+  DirectSound position, lock, unlock, clock and flush-wait calls no longer feed
+  uninitialized values into rendering. Resetting 8-bit PCM uses unsigned silence
+  (0x80).
 
 These follow-up source changes have not been built, tested or installed on the
 console. They are not yet evidence that the reported FEX/audio stall is fixed.
 The upstream main head was checked through Git and remains `1ac9b6cf`.
+
+Pending verification includes the existing `quartz:dsoundrender` flushing and
+EOS scenarios and `dsound:dsound` notification scenarios. Those sequential
+tests alone do not cover concurrent notification replacement or allocation
+failures; the new failure paths also need targeted coverage. The host
+`horizon-wine/check-audio.sh` exercises the audout backend, not the changed
+DirectSound/quartz DLL code, so passing it alone cannot validate these changes.
 
 ## First comparison, when console testing is requested
 
