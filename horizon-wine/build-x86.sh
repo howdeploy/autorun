@@ -8,6 +8,9 @@ set -eu
 root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 pe="$root/horizon-wine/build-wine-amd64-pe"
 export PATH="$root/horizon-wine/toolchains/llvm-mingw-20260505-ucrt-macos-universal/bin:/opt/homebrew/opt/bison/bin:$PATH"
+if [ -n "${WINE_NX_LLVM_MINGW:-}" ]; then
+    export PATH="$WINE_NX_LLVM_MINGW/bin:$PATH"
+fi
 if [ ! -f "$pe/Makefile" ]; then
     echo "No Wine tree in build-wine-amd64-pe; build-amd64-components.sh configures it." >&2
     exit 1
@@ -18,6 +21,10 @@ make -C "$pe" -j8 include/all
 sh "$root/horizon-wine/tools/bootstrap-box64-core.sh"
 sh "$root/horizon-wine/tools/bootstrap-wma.sh"
 docker run --rm -v "$root:/work" -w /work -e NX_MESA="${WINE_NX_MESA_SWITCH_DIR:-}" \
+    -e GIT_CONFIG_COUNT=3 \
+    -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/work \
+    -e GIT_CONFIG_KEY_1=safe.directory -e GIT_CONFIG_VALUE_1=/work/horizon-wine/vendor/box64 \
+    -e GIT_CONFIG_KEY_2=safe.directory -e GIT_CONFIG_VALUE_2=/work/horizon-wine/vendor/ffmpeg \
     "${WINE_NX_DEVKIT_IMAGE:-$(cat "$root/horizon-wine/switch-dev.txt")}" sh -ec '
     cmake -S horizon-wine -B horizon-wine/build-switch-wow64-mesa-switch -G Ninja \
         -DCMAKE_TOOLCHAIN_FILE=/work/horizon-wine/cmake/switch-devkitA64.cmake \

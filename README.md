@@ -9,8 +9,9 @@
 > DXVK and game settings profiles. Start with the
 > [New Vegas preparation and migration notes](documentation/new-vegas.md).
 > [Fork diagnostics](documentation/ru-diagnostics.md) remain available.
-> Source integration has not been built or tested on a console; existing TB4
-> binaries are historical and do not contain these changes.
+> The FEX/Vulkan runtime has been cross-compiled for installation; game launches
+> remain unverified. Existing TB4 binaries are historical and do not contain
+> these changes.
 
 <p align="center">
   Play Windows PC games on your Nintendo Switch.<br>

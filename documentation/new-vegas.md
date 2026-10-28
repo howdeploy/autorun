@@ -2,7 +2,8 @@
 
 Source preparation, 2026-10-28. Development branch: `main`. Upstream baseline:
 [`1ac9b6cf`](https://github.com/autorunhq/autorun/commit/1ac9b6cf37b90f2d5783dd7ef389bebbe1c68877).
-This is a source integration, not a measured FPS improvement or a tested NRO.
+The FEX/Vulkan NRO has been cross-compiled for installation. This is not a
+measured FPS improvement or a confirmed game launch.
 
 ## What comes from upstream
 
@@ -49,7 +50,10 @@ image. `sh build.sh --x86` selects the alternative Box64-only runtime. The
 packager honours `WINE_NX_LLVM_MINGW`, including the Linux toolchain selected
 by `build.sh`. The build also prepares the upstream boot bundle; building it
 does not install it on a console. Docker and toolchain downloads need network
-access and disk space. No build was run for this integration.
+access and disk space. The installation build uses the supported
+`build-amd64-components.sh` path without a boot bundle; no boot payloads are
+embedded in that NRO. Container Git trust is scoped to the mounted source and
+its pinned Box64/FFmpeg directories.
 
 ## Migration from our TB4/RU15 installation
 
@@ -103,6 +107,8 @@ diagnostics can change performance. Test sound, controls and save/load too.
   The video's description does not specify clocks, settings or runtime version.
   This is not a reproducible benchmark or a guarantee for this fork.
 
-No builds, automated tests, UI checks or console game launches were run for
-this source integration. Existing upstream tests are retained for the next
-validation step; successful launch and performance remain unverified.
+The FEX/DXVK/VKD3D runtime was cross-compiled in the pinned switch-dev image
+on 2026-10-28 while preparing its installation. The Linux package verifier
+uses the same `WINE_NX_LLVM_MINGW` toolchain as the build. Existing upstream
+tests are retained; automated test suites, UI checks and console game launches
+have not been run. Successful launch and performance remain unverified.
