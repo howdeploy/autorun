@@ -79,6 +79,37 @@ game's own installed files. A store client that must remain running is still
 incompatible with Autorun's single-process model. NVSE/xNVSE and its plugins
 have not been verified here; establish the base game first.
 
+## Main-menu music investigation, 2026-10-28
+
+The captured 13:04 launch uses our `main-nv1` runtime, FEX and DXVK in a
+39-bit address space. It opens `Data/Music/Special/MainTitle.mp3`, then fails
+to create the DirectShow MPEG-I Stream Splitter with `0x8007000e`.
+`winegstreamer` maps failure to create its Unix parser to `E_OUTOFMEMORY`;
+Horizon implements its decoder transforms but not that parser. The error is
+therefore not evidence that the entire console ran out of RAM. Runtime
+samples still show about 2 GB of free heap and advancing display submissions.
+They do not establish that the main menu became usable.
+
+Quartz now falls back to a native Layer III audio splitter when GStreamer
+cannot create its filter, following the existing native AVI fallback. It
+reuses the AVI splitter's sample delivery, allocator and seeking machinery,
+indexes complete MP3 frames, handles ID3v2/v1 tags, and accepts MPEG-1/2/2.5
+Layer III with fixed sample rate/channel layout and variable bitrate. MPEG
+header tables and lengths follow the older
+[Wine MPEG splitter](https://github.com/wine-mirror/wine/blob/27da4fa4498c3b6e0e46c72a9cdd13b620726e92/dlls/quartz/mpegsplit.c).
+It does not provide MPEG video or program-stream demuxing. Working GStreamer
+and AVI paths retain their behavior.
+
+This is a source correction for a confirmed media compatibility gap, not a
+verified fix for the reported splash-screen stall. It changes `quartz.dll`;
+replacing only the runtime NRO cannot install it. The installed DLL manifest
+still describes the pinned upstream payload. Any console trial needs the
+rebuilt x86 Quartz DLL and a retained original, without silently overwriting
+that manifest. Compilation, automated tests and a console trial of this change
+have not been run. Verbose traces were enabled in the captured session, which
+reached the 64 MiB log limit; use a separate trace-disabled comparison before
+drawing performance conclusions.
+
 ## First comparison, when console testing is requested
 
 Start with FEX and DXVK, frame generation off, verbose traces off, the Low

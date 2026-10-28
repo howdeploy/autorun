@@ -80,6 +80,7 @@ struct avi_splitter
     struct strmbase_filter filter;
     struct strmbase_sink sink;
     IAsyncReader *reader;
+    bool mpeg_audio;
 
     struct avi_stream **streams;
     size_t stream_count, stream_capacity;
@@ -294,6 +295,20 @@ static HRESULT WINAPI avi_change_rate(IMediaSeeking *iface)
     return S_OK;
 }
 
+static HRESULT attach_stream(struct avi_splitter *filter, struct avi_stream *stream, const WCHAR *name)
+{
+    if (!array_reserve((void **)&filter->streams, &filter->stream_capacity,
+            filter->stream_count + 1, sizeof(*filter->streams)))
+        return E_OUTOFMEMORY;
+    strmbase_source_init(&stream->pin, &filter->filter, name, &source_ops);
+    strmbase_seeking_init(&stream->seek, &seeking_vtbl, avi_change_stop, avi_change_current, avi_change_rate);
+    InitializeCriticalSectionEx(&stream->flushing_cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+    stream->flushing_cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": avi_stream.flushing_cs");
+    InitializeConditionVariable(&stream->eos_cv);
+    filter->streams[filter->stream_count++] = stream;
+    return S_OK;
+}
+
 /* A strl list; number counts every stream in the file, read or not. */
 static HRESULT parse_stream_list(struct avi_splitter *filter, const BYTE *data, DWORD size, unsigned int number)
 {
@@ -332,9 +347,6 @@ static HRESULT parse_stream_list(struct avi_splitter *filter, const BYTE *data, 
         return S_OK;
     }
 
-    if (!array_reserve((void **)&filter->streams, &filter->stream_capacity,
-            filter->stream_count + 1, sizeof(*filter->streams)))
-        return E_OUTOFMEMORY;
     if (!(stream = calloc(1, sizeof(*stream))))
         return E_OUTOFMEMORY;
     stream->number = number;
@@ -353,12 +365,12 @@ static HRESULT parse_stream_list(struct avi_splitter *filter, const BYTE *data, 
     }
 
     swprintf(name, ARRAY_SIZE(name), L"Stream %02u", number);
-    strmbase_source_init(&stream->pin, &filter->filter, name, &source_ops);
-    strmbase_seeking_init(&stream->seek, &seeking_vtbl, avi_change_stop, avi_change_current, avi_change_rate);
-    InitializeCriticalSectionEx(&stream->flushing_cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
-    stream->flushing_cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": avi_stream.flushing_cs");
-    InitializeConditionVariable(&stream->eos_cv);
-    filter->streams[filter->stream_count++] = stream;
+    if (FAILED(hr = attach_stream(filter, stream, name)))
+    {
+        FreeMediaType(&stream->mt);
+        free(stream);
+        return hr;
+    }
 
     TRACE("Stream %u:\n", number);
     strmbase_dump_media_type(&stream->mt);
@@ -486,6 +498,138 @@ static void remove_streams(struct avi_splitter *filter)
     BaseFilterImpl_IncrementPinVersion(&filter->filter);
 }
 
+struct mp3_header
+{
+    DWORD rate, bitrate, size, samples;
+    WORD channels;
+};
+
+/* MPEG header tables and frame lengths follow Wine's native MPEG splitter
+ * before 40a4c782 moved it to GStreamer. Reserved and free-format headers are rejected. */
+static bool mp3_header(const BYTE *p, struct mp3_header *h)
+{
+    static const WORD rates[] = {44100, 48000, 32000};
+    static const WORD bitrates[2][16] =
+    {
+        {0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0},
+        {0,8,16,24,32,40,48,56,64,80,96,112,128,144,160,0},
+    };
+    unsigned int version = (p[1] >> 3) & 3, frequency = (p[2] >> 2) & 3;
+
+    if (p[0] != 0xff || (p[1] & 0xe0) != 0xe0 || version == 1
+            || ((p[1] >> 1) & 3) != 1 || frequency == 3)
+        return false;
+    h->bitrate = bitrates[version != 3][p[2] >> 4] * 1000;
+    if (!h->bitrate)
+        return false;
+    h->rate = rates[frequency] >> (version == 3 ? 0 : version == 2 ? 1 : 2);
+    h->samples = version == 3 ? 1152 : 576;
+    h->channels = (p[3] >> 6) == 3 ? 1 : 2;
+    h->size = (version == 3 ? 144 : 72) * h->bitrate / h->rate + ((p[2] >> 1) & 1);
+    return true;
+}
+
+/* Reuse AVI's compressed-sample delivery and seeking. This fallback handles
+ * Layer III elementary audio, not MPEG program/video streams. */
+static HRESULT parse_mp3(struct avi_splitter *filter, LONGLONG file_size)
+{
+    struct avi_stream *stream = NULL;
+    struct mp3_header first, header, next;
+    MPEGLAYER3WAVEFORMAT format = {0};
+    BYTE *buffer, tag[10];
+    LONGLONG pos = 0, limit, end = file_size, base = -1;
+    DWORD length = 0;
+    HRESULT hr = VFW_E_INVALID_FILE_FORMAT;
+
+    if (file_size < 10 || read_data(filter, 0, sizeof(tag), tag) != S_OK)
+        return VFW_E_INVALID_FILE_FORMAT;
+    if (!memcmp(tag, "ID3", 3))
+    {
+        if ((tag[6] | tag[7] | tag[8] | tag[9]) & 0x80)
+            return VFW_E_INVALID_FILE_FORMAT;
+        pos = 10 + ((DWORD)tag[6] << 21 | (DWORD)tag[7] << 14 | (DWORD)tag[8] << 7 | tag[9]);
+        if (tag[3] == 4 && (tag[5] & 0x10)) pos += 10;
+        if (pos > file_size) return VFW_E_INVALID_FILE_FORMAT;
+    }
+    if (file_size >= 128 && read_data(filter, file_size - 128, 3, tag) == S_OK && !memcmp(tag, "TAG", 3))
+        end -= 128;
+    if (!(buffer = malloc(65536))) return E_OUTOFMEMORY;
+    limit = min(end, pos + 65536);
+    for (; pos + 4 <= end; pos += header.size)
+    {
+        const BYTE *p;
+
+        if (base < 0 || pos - base + 4 > length)
+        {
+            base = pos;
+            length = min(end - pos, 65536);
+            if ((hr = read_data(filter, pos, length, buffer)) != S_OK) goto done;
+        }
+        p = buffer + (pos - base);
+        if (!mp3_header(p, &header) || header.size > end - pos)
+        {
+            if (!stream && pos < limit) { header.size = 1; continue; }
+            hr = VFW_E_INVALID_FILE_FORMAT;
+            goto done;
+        }
+        if (!stream)
+        {
+            BYTE check[4];
+
+            /* A following frame avoids false sync inside tags. A complete
+             * one-frame file needs no following header. */
+            if (pos + header.size != end && (pos + header.size + 4 > end
+                    || read_data(filter, pos + header.size, 4, check) != S_OK
+                    || !mp3_header(check, &next) || next.rate != header.rate
+                    || next.channels != header.channels || next.samples != header.samples))
+            {
+                header.size = 1;
+                if (pos >= limit) { hr = VFW_E_INVALID_FILE_FORMAT; goto done; }
+                continue;
+            }
+            if (!(stream = calloc(1, sizeof(*stream)))) { hr = E_OUTOFMEMORY; goto done; }
+            first = header;
+            stream->rate = header.rate;
+            stream->scale = header.samples;
+            format.wfx.wFormatTag = WAVE_FORMAT_MPEGLAYER3;
+            format.wfx.nChannels = header.channels;
+            format.wfx.nSamplesPerSec = header.rate;
+            format.wfx.nAvgBytesPerSec = header.bitrate / 8;
+            format.wfx.nBlockAlign = 1;
+            format.wfx.cbSize = MPEGLAYER3_WFX_EXTRA_BYTES;
+            format.wID = MPEGLAYER3_ID_MPEG;
+            format.nFramesPerBlock = 1;
+        }
+        if (header.rate != first.rate || header.channels != first.channels || header.samples != first.samples)
+        {
+            hr = VFW_E_INVALID_FILE_FORMAT;
+            goto done;
+        }
+        if (!add_chunk(stream, pos, header.size, true)) { hr = E_OUTOFMEMORY; goto done; }
+    }
+    if (!stream || pos != end) { hr = VFW_E_INVALID_FILE_FORMAT; goto done; }
+    format.nBlockSize = stream->max_chunk_size;
+    if (SUCCEEDED(hr = init_audio_type(stream, (BYTE *)&format, sizeof(format))))
+    {
+        stream->mt.bFixedSizeSamples = FALSE;
+        stream->mt.lSampleSize = 0;
+        if (SUCCEEDED(hr = attach_stream(filter, stream, L"Audio")))
+        {
+            stream = NULL;
+            TRACE("Native MP3 splitter: indexed audio without GStreamer.\n");
+        }
+    }
+done:
+    if (stream)
+    {
+        FreeMediaType(&stream->mt);
+        free(stream->chunks);
+        free(stream);
+    }
+    free(buffer);
+    return hr;
+}
+
 static HRESULT avi_sink_connect(struct strmbase_sink *iface, IPin *peer, const AM_MEDIA_TYPE *mt)
 {
     struct avi_splitter *filter = impl_from_strmbase_sink(iface);
@@ -497,7 +641,12 @@ static HRESULT avi_sink_connect(struct strmbase_sink *iface, IPin *peer, const A
 
     if (FAILED(hr = IPin_QueryInterface(peer, &IID_IAsyncReader, (void **)&filter->reader)))
         return hr;
-    IAsyncReader_Length(filter->reader, &file_size, &available);
+    if (FAILED(hr = IAsyncReader_Length(filter->reader, &file_size, &available))) goto fail;
+    if (filter->mpeg_audio)
+    {
+        if (FAILED(hr = parse_mp3(filter, file_size))) goto fail;
+        goto streams_ready;
+    }
 
     if (read_data(filter, 0, 12, header) != S_OK
             || get_dword(header) != AVI_FCC('R','I','F','F') || get_dword(header + 8) != AVI_FCC('A','V','I',' '))
@@ -566,6 +715,7 @@ static HRESULT avi_sink_connect(struct strmbase_sink *iface, IPin *peer, const A
     if (FAILED(hr))
         goto fail;
 
+streams_ready:
     for (i = 0; i < filter->stream_count; ++i)
     {
         struct avi_stream *stream = filter->streams[i];
@@ -604,6 +754,13 @@ static void avi_sink_disconnect(struct strmbase_sink *iface)
  * subtype, so the header is checked on connection instead. */
 static HRESULT avi_sink_query_accept(struct strmbase_pin *iface, const AM_MEDIA_TYPE *mt)
 {
+    struct avi_splitter *filter = impl_from_strmbase_filter(iface->filter);
+
+    if (filter->mpeg_audio)
+        return IsEqualGUID(&mt->majortype, &MEDIATYPE_Stream)
+                && (IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_MPEG1Audio)
+                    || IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_MPEG1System)
+                    || IsEqualGUID(&mt->subtype, &GUID_NULL)) ? S_OK : S_FALSE;
     if (IsEqualGUID(&mt->majortype, &MEDIATYPE_Stream)
             && (IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_Avi) || IsEqualGUID(&mt->subtype, &GUID_NULL)))
         return S_OK;
@@ -981,17 +1138,28 @@ static const struct strmbase_filter_ops filter_ops =
     .filter_cleanup_stream = avi_cleanup_stream,
 };
 
-HRESULT native_avi_splitter_create(IUnknown *outer, IUnknown **out)
+static HRESULT native_splitter_create(IUnknown *outer, IUnknown **out, bool mpeg_audio)
 {
     struct avi_splitter *object;
 
     if (!(object = calloc(1, sizeof(*object))))
         return E_OUTOFMEMORY;
 
-    strmbase_filter_init(&object->filter, outer, &CLSID_AviSplitter, &filter_ops);
-    strmbase_sink_init(&object->sink, &object->filter, L"input pin", &sink_ops, NULL);
+    object->mpeg_audio = mpeg_audio;
+    strmbase_filter_init(&object->filter, outer, mpeg_audio ? &CLSID_MPEG1Splitter : &CLSID_AviSplitter, &filter_ops);
+    strmbase_sink_init(&object->sink, &object->filter, mpeg_audio ? L"Input" : L"input pin", &sink_ops, NULL);
 
-    TRACE("Created AVI splitter %p.\n", object);
+    TRACE("Created %s splitter %p.\n", mpeg_audio ? "MP3" : "AVI", object);
     *out = &object->filter.IUnknown_inner;
     return S_OK;
+}
+
+HRESULT native_avi_splitter_create(IUnknown *outer, IUnknown **out)
+{
+    return native_splitter_create(outer, out, false);
+}
+
+HRESULT native_mpeg_audio_splitter_create(IUnknown *outer, IUnknown **out)
+{
+    return native_splitter_create(outer, out, true);
 }
