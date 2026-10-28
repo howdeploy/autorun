@@ -204,6 +204,94 @@ Autorun process before the console trial so the new DLLs are loaded.
 
 ## First comparison, when console testing is requested
 
+### Community media stack, 2026-10-28
+
+The [community's Russian New Vegas report](https://t.me/AutoRunn/11247) uses
+Carafe 0.4.0, FEX, DXVK Sarek 1.14.1, DSOAL and LAV Filters. The author reports
+about 30 FPS outdoors at CPU/GPU/RAM 1785/768/2200 MHz, with drops to 20, and
+40–50 FPS at 2499/768/2733 MHz. These are the author's observations, not this
+fork's measurements or approved clock profiles for another console. The post
+does not publish the exact DSOAL/LAV versions, the complete FEX settings or
+the New Vegas resolution. The linked Fallout 3 test's Low/720p settings must
+not be presented as measured New Vegas settings.
+
+An earlier [GOG report](https://github.com/autorunhq/autorun/issues/22#issuecomment-5913970335)
+starts after renaming `Data/Music`. Another
+[TB4 report](https://github.com/autorun-db/autorun-db.github.io/issues/27)
+confirms gameplay with that bypass and a 39-bit forwarder, while leaving
+long-session stability and save/reload unverified. Neither workaround proves
+that the current FEX stall is fixed. The 16:29 session after our audio fixes
+still stops submitting frames with `wine_dsound_mixer` using 99.8% of one core.
+
+The fork provides two preparation/deployment tools:
+
+```sh
+python3 horizon-wine/tools/prepare-falloutnv-media.py /path/to/media-bundle \
+  --runtime horizon-dlls/switch/wine
+python3 horizon-wine/tools/install-falloutnv-media-ftp.py /path/to/media-bundle \
+  --host SWITCH_IP --port 5000 --user FTP_USER
+```
+
+The first downloads SHA-256-pinned official DSOAL r697 (with OpenAL Soft
+r10853), LAV Filters 0.83 x86 and Sarek 1.14.1. These are explicit trial
+versions, not a claim that the community tested these exact audio binaries.
+DSOAL and LAV live beside `FalloutNV.exe`; OpenAL uses WASAPI, stereo 48 kHz,
+without falling back into DirectSound. Sarek stays in its own version folder.
+The Windows system DLLs and the upstream DLL manifest are not replaced.
+Licenses, source URLs and file hashes accompany the bundle.
+
+The second backs up game settings and the shared Wine registry, stages and
+reads back every file, activates with renames, and checks the system DLLs
+and upstream manifest remained unchanged. Partial activation is rolled back
+when possible; unknown changed files are retained for manual recovery. It
+keeps a deployment journal and the original files on the PC and, for replaced
+files, beside the target on the SD card. Passwords are entered through a
+hidden prompt and are not recorded.
+
+Per-game settings select FEX, Sarek 1.14.1, 30 FPS, VSync, no frame generation
+and no verbose/profile logging, retaining unrelated settings. In this version
+`d3d=dxvk` is a legacy spelling for DXVK+VKD3D, which rejects Sarek: remove
+`d3d` and `d3d9` to select the default DXVK-only mode with Sarek.
+
+On the next ordinary Autorun start, `run-next.txt` first runs
+`FalloutNV-media-enable.exe`, a matching copy of Wine's x86 `reg.exe`, which
+sets only `HKCU\Software\Wine\AppDefaults\FalloutNV.exe\DllOverrides\dsound`
+to `native`. DSOAL's Microsoft vendor resource otherwise lets Wine prefer its
+builtin. The installer refuses to overwrite an existing per-game dsound
+override. Next it runs `FalloutNV-media-register.exe`, a matching copy of
+Wine's x86 `regsvr32.exe`. Both use their own `.args.txt`, without a child
+process. The latter registers LAV Splitter, Audio and Video in sequence.
+Check both fresh logs for successful completion and the latter for three
+successful registrations and exit code 0 before launching the game.
+Uploading files alone does not complete registration. LAV's registrations
+affect the shared Wine registry and can influence other DirectShow games.
+No game launch, firmware/clock change, music removal, localization edit or
+game INI change is performed by these tools.
+
+To revert after registration, run `FalloutNV-media-unregister.exe` and
+`FalloutNV-media-disable.exe` through Autorun's Run a program once (the latter
+removes only the new per-game dsound override), then run
+`C:\windows\autorun-setup.exe` to
+restore the Wine filter registrations. Retain that log, restore the original
+game settings from the deployment receipt's backup, and move the installed
+game-local DLLs/AX files and `alsoft.ini` out of the active game folder using
+the receipt's hashes to identify them. Keep the registrar until unregistration
+has completed. Restore an entire registry snapshot only when no intervening
+game or registry changes need preserving. Do not remove `Data/Sound`, dialogue
+archives, `Data/Video` or localization plugins as part of this rollback.
+
+The prepared bundle's 23 PE files were inspected against the pinned x86
+runtime: 4157 imports resolve by name/ordinal, including the runtime's CRT
+API-set redirection. This is static dependency inspection; Windows API
+behavior, successful registration and actual console gameplay still need
+their own evidence. No new runtime tests or builds were run for this bundle.
+
+The 49-file bundle, per-game settings and two-step setup queue were uploaded
+and SHA-256 readback verified over Autorun FTP on 2026-10-28. The original
+settings and pre-registration registry are backed up on the PC. System
+Quartz, DirectSound and the upstream DLL manifest were verified unchanged.
+Registration is pending the user's next restart; gameplay remains unverified.
+
 Start with FEX and DXVK, frame generation off, verbose traces off, the Low
 preset, anti-aliasing off and 1280x720. These are proposed comparison settings,
 not a community-certified performance preset. Keep clocks fixed and record
