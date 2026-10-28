@@ -1,0 +1,520 @@
+diff --git a/binding-sandbox/binding-sandbox.cpp b/binding-sandbox/binding-sandbox.cpp
+index 720ea7e..15e5d78 100644
+--- a/binding-sandbox/binding-sandbox.cpp
++++ b/binding-sandbox/binding-sandbox.cpp
+@@ -578,6 +578,14 @@ static VALUE default_font_family(VALUE self, VALUE value) {
+     return sb()->bind<struct coro>()()(self, value);
+ }
+ 
++static VALUE loading_cpu_boost(VALUE self, VALUE enabled) {
++#if defined(__GNUC__)
++    if (mkxp_switch_set_loading_boost)
++        return SANDBOX_BOOL_TO_VALUE(mkxp_switch_set_loading_boost(SANDBOX_VALUE_TO_BOOL(enabled)) != 0);
++#endif
++    return SANDBOX_BOOL_TO_VALUE(false);
++}
++
+ static VALUE system_puts(int32_t argc, wasm_ptr_t argv, VALUE self) {
+     struct coro : boost::asio::coroutine {
+         typedef decl_slots<VALUE, ID> slots;
+@@ -838,6 +846,8 @@ void sandbox_binding_init::operator()() {
+ 
+         SANDBOX_AWAIT_R(system_module, rb_define_module, "System");
+ 
++        SANDBOX_AWAIT(rb_define_module_function, system_module, "set_loading_cpu_boost", (VALUE (*)(ANYARGS))loading_cpu_boost, 1);
++
+         SANDBOX_AWAIT(rb_define_module_function, system_module, "delta", (VALUE (*)(ANYARGS))delta, 0);
+         SANDBOX_AWAIT(rb_define_module_function, system_module, "uptime", (VALUE (*)(ANYARGS))delta, 0);
+         SANDBOX_AWAIT(rb_define_module_function, system_module, "data_directory", (VALUE (*)(ANYARGS))data_directory, 0);
+diff --git a/binding-sandbox/bitmap-binding.cpp b/binding-sandbox/bitmap-binding.cpp
+index 21d16b7..efe5f98 100644
+--- a/binding-sandbox/bitmap-binding.cpp
++++ b/binding-sandbox/bitmap-binding.cpp
+@@ -24,9 +24,87 @@
+ #include "etc-binding.h"
+ #include "font-binding.h"
+ #include "bitmap.h"
++#include <unordered_map>
++#include <limits>
++#include <cstdlib>
+ 
+ using namespace mkxp_sandbox;
+ 
++static void apply_lona_palette(Exception &error, Bitmap &bitmap, const uint8_t *blob, size_t length) {
++    struct Filter { uint32_t x0, y0, x1, y1; std::unordered_map<uint32_t, uint32_t> colors; };
++    size_t pos = 0;
++    auto word = [&]() {
++        uint32_t value = uint32_t(blob[pos]) | uint32_t(blob[pos+1]) << 8 |
++                         uint32_t(blob[pos+2]) << 16 | uint32_t(blob[pos+3]) << 24;
++        pos += 4;
++        return value;
++    };
++    auto invalid = [&]() { error = Exception(Exception::MKXPError, "Invalid Lona palette command"); };
++    if (length < 4) { invalid(); return; }
++    const uint32_t count = word();
++    if (count > (length - pos) / 20) { invalid(); return; }
++    const int width = bitmap.getWidth(error), height = bitmap.getHeight(error);
++    if (error.is_error()) return;
++    std::vector<Filter> filters;
++    for (uint32_t i = 0; i < count; ++i) {
++        if (length - pos < 20) { invalid(); return; }
++        Filter f;
++        f.x0 = word(); f.y0 = word(); f.x1 = word(); f.y1 = word();
++        const uint32_t pairs = word();
++        if (f.x0 > f.x1 || f.y0 > f.y1 || f.x1 > uint32_t(width) || f.y1 > uint32_t(height) ||
++            pairs > (length - pos) / 8) { invalid(); return; }
++        for (uint32_t j = 0; j < pairs; ++j) {
++            const uint32_t from = word(), to = word();
++            if ((from | to) > 0xffffff) { invalid(); return; }
++            f.colors[from] = to;
++        }
++        if (!f.colors.empty() && f.x0 != f.x1 && f.y0 != f.y1) filters.push_back(std::move(f));
++    }
++    if (pos != length) { invalid(); return; }
++    if (filters.empty()) return;
++    const uint64_t bytes = uint64_t(width) * uint64_t(height) * 4;
++    if (bytes > uint64_t(std::numeric_limits<int>::max())) { invalid(); return; }
++    if (bytes == 0) return;
++    std::unique_ptr<uint8_t, decltype(&std::free)> pixels(static_cast<uint8_t *>(std::malloc(size_t(bytes))), &std::free);
++    if (!pixels) { error = Exception(Exception::MKXPError, "Not enough memory for Lona palette conversion"); return; }
++    if (!bitmap.getRaw(error, pixels.get(), int(bytes))) return;
++    if (error.is_error()) return;
++    bool changed = false;
++    for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) {
++        // The game's palette rectangles use bottom-first BGRA rows.
++        uint8_t *p = pixels.get() + (size_t(height - 1 - y) * width + x) * 4;
++        const uint32_t original = uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16;
++        uint32_t color = original;
++        for (const auto &f : filters) {
++            if (uint32_t(x) < f.x0 || uint32_t(x) >= f.x1 || uint32_t(y) < f.y0 || uint32_t(y) >= f.y1) continue;
++            const auto found = f.colors.find(original);
++            if (found != f.colors.end()) color = found->second;
++        }
++        if (color != original) {
++            p[0] = uint8_t(color); p[1] = uint8_t(color >> 8); p[2] = uint8_t(color >> 16);
++            changed = true;
++        }
++    }
++    if (changed) bitmap.replaceRaw(error, pixels.get(), int(bytes));
++}
++
++static VALUE lona_palette(VALUE self, VALUE value) {
++    struct coro : boost::asio::coroutine {
++        typedef decl_slots<wasm_ptr_t, int32_t> slots;
++        VALUE operator()(VALUE self, VALUE value) {
++            BOOST_ASIO_CORO_REENTER(this) {
++                SANDBOX_AWAIT_S(0, rb_string_value_ptr, &value);
++                SANDBOX_AWAIT_S(1, get_bytesize, value);
++                sb()->check_bounds(SANDBOX_SLOT(0), SANDBOX_SLOT(1));
++                SANDBOX_GUARD_L(apply_lona_palette(sb().e, *get_private_data<Bitmap>(self),
++                    &sb()->ref<uint8_t>(SANDBOX_SLOT(0)), SANDBOX_SLOT(1)));
++            }
++            return self;
++        }
++    };
++    return sb()->bind<struct coro>()()(self, value);
++}
++
+ VALUE mkxp_sandbox::bitmap_class;
+ static struct bindings::rb_data_type bitmap_type;
+ 
+@@ -1044,6 +1122,7 @@ void bitmap_binding_init::operator()() {
+         SANDBOX_AWAIT(rb_define_method, bitmap_class, "text_size", (VALUE (*)(ANYARGS))text_size, 1);
+ 
+         SANDBOX_INIT_PROP_BIND(bitmap_class, raw_data);
++        SANDBOX_AWAIT(rb_define_method, bitmap_class, "_lona_palette", (VALUE (*)(ANYARGS))lona_palette, 1);
+         SANDBOX_AWAIT(rb_define_method, bitmap_class, "to_file", (VALUE (*)(ANYARGS))to_file, 1);
+ 
+         SANDBOX_AWAIT(rb_define_method, bitmap_class, "gradient_fill_rect", (VALUE (*)(ANYARGS))gradient_fill_rect, -1);
+diff --git a/binding-sandbox/input-binding.cpp b/binding-sandbox/input-binding.cpp
+index 6b7f3e5..83d3f42 100644
+--- a/binding-sandbox/input-binding.cpp
++++ b/binding-sandbox/input-binding.cpp
+@@ -342,7 +342,7 @@ static VALUE mouse_in_window(VALUE self) {
+     return SANDBOX_BOOL_TO_VALUE(mkxp_retro::input->mouseInWindow());
+ }
+ 
+-static VALUE raw_key_states(VALUE self) {
++template <bool physical> static VALUE raw_key_states(VALUE self) {
+     struct coro : boost::asio::coroutine {
+         typedef decl_slots<VALUE, uint32_t, uint32_t> slots;
+ 
+@@ -351,7 +351,9 @@ static VALUE raw_key_states(VALUE self) {
+                 SANDBOX_SLOT(2) = mkxp_retro::input->rawKeyStatesLength();
+                 SANDBOX_AWAIT_S(0, rb_ary_new_capa, SANDBOX_SLOT(2));
+                 for (SANDBOX_SLOT(1) = 0; SANDBOX_SLOT(1) < SANDBOX_SLOT(2); ++SANDBOX_SLOT(1)) {
+-                    SANDBOX_AWAIT(rb_ary_push, SANDBOX_SLOT(0), SANDBOX_BOOL_TO_VALUE(mkxp_retro::input->rawKeyStates()[SANDBOX_SLOT(1)]));
++                    SANDBOX_AWAIT(rb_ary_push, SANDBOX_SLOT(0), SANDBOX_BOOL_TO_VALUE(physical
++                        ? mkxp_retro::input->physicalKeyState(SANDBOX_SLOT(1))
++                        : mkxp_retro::input->rawKeyStates()[SANDBOX_SLOT(1)]));
+                 }
+             }
+ 
+@@ -641,7 +643,8 @@ void input_binding_init::operator()() {
+         SANDBOX_AWAIT(rb_define_module_function, input_module, "mouse_in_window", (VALUE (*)(ANYARGS))mouse_in_window, 0);
+         SANDBOX_AWAIT(rb_define_module_function, input_module, "mouse_in_window?", (VALUE (*)(ANYARGS))mouse_in_window, 0);
+ 
+-        SANDBOX_AWAIT(rb_define_module_function, input_module, "raw_key_states", (VALUE (*)(ANYARGS))raw_key_states, 0);
++        SANDBOX_AWAIT(rb_define_module_function, input_module, "raw_key_states", (VALUE (*)(ANYARGS))raw_key_states<false>, 0);
++        SANDBOX_AWAIT(rb_define_module_function, input_module, "physical_key_states", (VALUE (*)(ANYARGS))raw_key_states<true>, 0);
+ 
+         SANDBOX_AWAIT_R(input_controller_module, rb_define_module_under, input_module, "Controller");
+         SANDBOX_AWAIT(rb_define_module_function, input_controller_module, "connected?", (VALUE (*)(ANYARGS))controller_connected, 0);
+diff --git a/binding-sandbox/wasi.cpp b/binding-sandbox/wasi.cpp
+index 426c943..7a68837 100644
+--- a/binding-sandbox/wasi.cpp
++++ b/binding-sandbox/wasi.cpp
+@@ -27,6 +27,8 @@
+ #include <functional>
+ #include <random>
+ #include <utility>
++#include <cstdio>
++#include <cerrno>
+ #include <mkxp-sandbox-ruby.h>
+ #include "filesystem.h"
+ #include "core.h"
+@@ -85,6 +87,39 @@ static std::string dir_path_join(const struct wasi_instance *wasi, uint32_t fd,
+     return joined_path;
+ }
+ 
++#ifdef __SWITCH__
++static uint32_t rename_writable_file(const wasi_instance *wasi, uint32_t fd, uint32_t new_fd,
++                                    const std::string &old_path, const std::string &new_path) {
++    const char *write_dir = PHYSFS_getWriteDir();
++    if (!write_dir) return WASIP1_EROFS;
++    auto physical = [&](uint32_t descriptor, const std::string &path) {
++        const uint32_t root = wasi->fdtable[descriptor].type == wasi_fd_type::FS ? descriptor : wasi->fdtable[descriptor].dir_handle()->root;
++        if (root >= wasi->fdtable.size() || wasi->fdtable[root].type != wasi_fd_type::FS) return std::string();
++        const std::string &prefix = wasi->fdtable[root].dir_handle()->path;
++        if (prefix.empty() || path.size() <= prefix.size() || path.compare(0, prefix.size(), prefix) ||
++            (prefix.back() != '/' && path[prefix.size()] != '/')) return std::string();
++        size_t first = prefix.size();
++        while (first < path.size() && path[first] == '/') ++first;
++        return std::string(write_dir) + '/' + path.substr(first);
++    };
++    const char *real_dir = PHYSFS_getRealDir(old_path.c_str());
++    if (!real_dir) return WASIP1_ENOENT;
++    if (std::strcmp(real_dir, write_dir)) return WASIP1_EROFS;
++    const std::string from = physical(fd, old_path), to = physical(new_fd, new_path);
++    if (from.empty() || to.empty()) return WASIP1_EPERM;
++    PHYSFS_Stat stat;
++    if (!PHYSFS_stat(old_path.c_str(), &stat)) return WASIP1_ENOENT;
++    if (stat.filetype != PHYSFS_FILETYPE_REGULAR) return WASIP1_ENOTSUP;
++    if (!std::rename(from.c_str(), to.c_str())) return WASIP1_ESUCCESS;
++    switch (errno) {
++        case ENOENT: return WASIP1_ENOENT;
++        case ENOSPC: return WASIP1_ENOSPC;
++        case EACCES: case EPERM: return WASIP1_EPERM;
++        default: return WASIP1_EIO;
++    }
++}
++#endif
++
+ struct fs_dir *wasi_file_entry::dir_handle() const noexcept {
+     return (struct fs_dir *)handle;
+ }
+@@ -2425,7 +2460,7 @@ extern "C" void w2c_wasi0x3Afilesystem0x2Ftypes0x4000x2E20x2E0_0x5Bmethod0x5Ddes
+ 
+     wasi->check_bounds(result, 2);
+ 
+-    if (fd >= wasi->fdtable.size()) {
++    if (fd >= wasi->fdtable.size() || new_descriptor >= wasi->fdtable.size()) {
+         wasi->ref<uint8_t>(result) = true;
+         wasi->ref<uint8_t>(result + 1) = WASI_FILESYSTEM_ERROR_BAD_DESCRIPTOR;
+         return;
+@@ -2451,6 +2486,11 @@ extern "C" void w2c_wasi0x3Afilesystem0x2Ftypes0x4000x2E20x2E0_0x5Bmethod0x5Ddes
+         case wasi_fd_type::FS:
+         case wasi_fd_type::FSDIR:
+             {
++                if ((wasi->fdtable[new_descriptor].type != wasi_fd_type::FS && wasi->fdtable[new_descriptor].type != wasi_fd_type::FSDIR) || !wasi->fdtable[new_descriptor].dir_handle()->writable) {
++                    wasi->ref<uint8_t>(result) = true;
++                    wasi->ref<uint8_t>(result + 1) = WASI_FILESYSTEM_ERROR_NOT_PERMITTED;
++                    return;
++                }
+                 if (!wasi->fdtable[fd].dir_handle()->writable) {
+                     wasi->ref<uint8_t>(result) = true;
+                     wasi->ref<uint8_t>(result + 1) = WASI_FILESYSTEM_ERROR_READ_ONLY;
+@@ -2464,13 +2504,24 @@ extern "C" void w2c_wasi0x3Afilesystem0x2Ftypes0x4000x2E20x2E0_0x5Bmethod0x5Ddes
+                     return;
+                 }
+ 
+-                std::string joined_new_path = dir_path_join(wasi, fd, new_path, new_path_len);
++                std::string joined_new_path = dir_path_join(wasi, new_descriptor, new_path, new_path_len);
+                 if (joined_new_path.empty()) {
+                     wasi->ref<uint8_t>(result) = true;
+                     wasi->ref<uint8_t>(result + 1) = WASI_FILESYSTEM_ERROR_NOT_PERMITTED;
+                     return;
+                 }
+ 
++#ifdef __SWITCH__
++                const uint32_t rc = rename_writable_file(wasi, fd, new_descriptor, joined_old_path, joined_new_path);
++                wasi->ref<uint8_t>(result) = rc != WASIP1_ESUCCESS;
++                if (rc != WASIP1_ESUCCESS) {
++                    wasi->ref<uint8_t>(result + 1) = rc == WASIP1_ENOENT ? WASI_FILESYSTEM_ERROR_NO_ENTRY :
++                        rc == WASIP1_EROFS ? WASI_FILESYSTEM_ERROR_READ_ONLY :
++                        rc == WASIP1_EPERM ? WASI_FILESYSTEM_ERROR_NOT_PERMITTED : WASI_FILESYSTEM_ERROR_IO;
++                }
++                return;
++#endif
++
+                 PHYSFS_Stat old_stat;
+                 if (!PHYSFS_stat(joined_old_path.c_str(), &old_stat)) {
+                     wasi->ref<uint8_t>(result) = true;
+@@ -2542,7 +2593,7 @@ extern "C" uint32_t w2c_wasi__snapshot__preview1_path_rename(struct w2c_wasi__sn
+     wasi->check_bounds(new_path, new_path_len);
+     LOG_PRINTF(RETRO_LOG_DEBUG, "wasi_snapshot_preview1::path_rename(%u, \"%.*s\", %u, \"%.*s\")\n", (unsigned int)fd, (int)std::min(old_path_len, (uint32_t)INT_MAX), (const char *)wasi->str(old_path, old_path_len), (unsigned int)new_fd, (int)std::min(new_path_len, (uint32_t)INT_MAX), (const char *)wasi->str(new_path, new_path_len));
+ 
+-    if (fd >= wasi->fdtable.size()) {
++    if (fd >= wasi->fdtable.size() || new_fd >= wasi->fdtable.size()) {
+         return WASIP1_EBADF;
+     }
+ 
+@@ -2562,6 +2613,7 @@ extern "C" uint32_t w2c_wasi__snapshot__preview1_path_rename(struct w2c_wasi__sn
+         case wasi_fd_type::FS:
+         case wasi_fd_type::FSDIR:
+             {
++                if ((wasi->fdtable[new_fd].type != wasi_fd_type::FS && wasi->fdtable[new_fd].type != wasi_fd_type::FSDIR) || !wasi->fdtable[new_fd].dir_handle()->writable) return WASIP1_EPERM;
+                 if (!wasi->fdtable[fd].dir_handle()->writable) {
+                     return WASIP1_EROFS;
+                 }
+@@ -2571,11 +2623,15 @@ extern "C" uint32_t w2c_wasi__snapshot__preview1_path_rename(struct w2c_wasi__sn
+                     return WASIP1_EPERM;
+                 }
+ 
+-                std::string joined_new_path = dir_path_join(wasi, fd, new_path, new_path_len);
++                std::string joined_new_path = dir_path_join(wasi, new_fd, new_path, new_path_len);
+                 if (joined_new_path.empty()) {
+                     return WASIP1_EPERM;
+                 }
+ 
++#ifdef __SWITCH__
++                return rename_writable_file(wasi, fd, new_fd, joined_old_path, joined_new_path);
++#endif
++
+                 PHYSFS_Stat old_stat;
+                 if (!PHYSFS_stat(joined_old_path.c_str(), &old_stat)) {
+                     return WASIP1_ENOENT;
+diff --git a/src/core.cpp b/src/core.cpp
+index 5c07127..e8a6c77 100644
+--- a/src/core.cpp
++++ b/src/core.cpp
+@@ -459,6 +459,10 @@ struct main : boost::asio::coroutine {
+ };
+ 
+ static void deinit_sandbox() {
++#if defined(__GNUC__)
++    if (mkxp_switch_set_loading_boost)
++        mkxp_switch_set_loading_boost(0);
++#endif
+     bool shared_state_was_initialized = shared_state_initialized.load_relaxed();
+     shared_state_initialized = false;
+     struct lock_guard guard(threaded_audio_mutex); // Wait for the audio thread to stop rendering audio
+@@ -1496,6 +1500,10 @@ extern "C" RETRO_API void retro_reset() {
+ }
+ 
+ extern "C" RETRO_API void retro_run() {
++#if defined(__GNUC__)
++    if (mkxp_switch_loading_boost_poll)
++        mkxp_switch_loading_boost_poll();
++#endif
+     // We need to wait until the graphics context is initialized before initializing shared state,
+     // which is why we initialize it here instead of in `retro_load_game()`
+     if (mkxp_retro::sandbox.has_value() && !shared_state_initialized.load_relaxed()) {
+diff --git a/src/core.h b/src/core.h
+index 1a7ab1c..9f9c569 100644
+--- a/src/core.h
++++ b/src/core.h
+@@ -30,6 +30,11 @@
+ 
+ extern retro_log_printf_t mkxp_retro_log_printf;
+ 
++#if defined(__GNUC__)
++extern "C" int mkxp_switch_set_loading_boost(int enabled) __attribute__((weak));
++extern "C" void mkxp_switch_loading_boost_poll(void) __attribute__((weak));
++#endif
++
+ namespace mkxp_retro {
+     extern boost::optional<struct mkxp_sandbox::sandbox> sandbox;
+     extern boost::optional<Audio> audio;
+diff --git a/src/display/font.cpp b/src/display/font.cpp
+index 11be0be..89dce8b 100644
+--- a/src/display/font.cpp
++++ b/src/display/font.cpp
+@@ -190,12 +190,12 @@ struct SharedFontStatePrivate
+ 	boost::optional<SharedFontStatePrivate::PoolEntry> ftOpenFile(std::shared_ptr<struct FileSystem::File> ops)
+ 	{
+ 		SharedFontStatePrivate::PoolEntry entry;
++		PHYSFS_sint64 length = PHYSFS_fileLength(ops.get()->get_read());
++		if (length <= 0 || (uint64_t)length > std::min((uint64_t)SIZE_MAX, (uint64_t)ULONG_MAX)) {
++			return boost::none;
++		}
+ 
+ 		if (shState->config().loadFontsIntoMemory) {
+-			PHYSFS_sint64 length = PHYSFS_fileLength(ops.get()->get_read());
+-			if (length == -1 || (uint64_t)length > std::min((uint64_t)SIZE_MAX, (uint64_t)ULONG_MAX)) {
+-				return boost::none;
+-			}
+ 			uint8_t *data = (uint8_t *)std::malloc((size_t)length);
+ 			if (data == nullptr) {
+ 				return boost::none;
+@@ -214,7 +214,7 @@ struct SharedFontStatePrivate
+ 
+ 			entry.rec = new FT_StreamRec {
+ 				nullptr,
+-				(unsigned long)-1,
++				(unsigned long)length,
+ 				0,
+ 				{},
+ 				{},
+@@ -241,7 +241,7 @@ struct SharedFontStatePrivate
+ 		} else {
+ 			entry.rec = new FT_StreamRec {
+ 				nullptr,
+-				(unsigned long)-1,
++				(unsigned long)length,
+ 				0,
+ 				{},
+ 				{},
+@@ -272,9 +272,11 @@ struct SharedFontStatePrivate
+ 			nullptr,
+ 		};
+ 	
+-		if (!FT_Open_Face(library, entry.args, 0, &entry.font)) {
++		FT_Error error = FT_Open_Face(library, entry.args, 0, &entry.font);
++		if (!error) {
+ 			return entry;
+ 		} else {
++			Debug() << "FreeType font open error:" << error << "stream bytes:" << length;
+ 			return boost::none;
+ 		}
+ 	}
+@@ -365,7 +367,10 @@ void SharedFontState::initFontSetCB(
+ #ifdef MKXPZ_RETRO
+ 	boost::optional<SharedFontStatePrivate::PoolEntry> entry = p->ftOpenFile(ops);
+ 	if (!entry.has_value())
++	{
++		Debug() << "Failed to register font:" << filename;
+ 		return;
++	}
+ 
+ 	std::string family(entry->font->family_name);
+ 	std::string style(entry->font->style_name);
+@@ -382,6 +387,10 @@ void SharedFontState::initFontSetCB(
+ 	std::transform(family.begin(), family.end(), family.begin(),
+ 		[](unsigned char c){ return std::tolower(c); });
+ 
++#ifdef MKXPZ_SWITCH_DIAG
++	Debug() << "Registered font:" << filename << "family:" << family << "style:" << style;
++#endif
++
+ 	FontSet &set = p->sets[family];
+ 
+ 	if (style == "Regular" && set.regular.empty())
+@@ -784,10 +793,8 @@ SharedFontState::getFont(Exception &exception, std::string family,
+ 	}
+ 	else
+ 	{
+-		/* Use 'other' path as alternative in case
+-		 * we have no 'regular' styled font asset */
+-		const char *path = !req.regular.empty()
+-		                 ? req.regular.c_str() : req.other.c_str();
++		/* Resolve SFNT aliases in the same order as fontPresent(). */
++		const char *path = req->c_str();
+ 
+ 		entry = p->ftOpenFile(std::shared_ptr<struct FileSystem::File>(new struct FileSystem::File(*mkxp_retro::fs, path)));
+ 		if (!entry.has_value())
+diff --git a/src/filesystem/filesystem.cpp b/src/filesystem/filesystem.cpp
+index 98890ba..0f5b7a7 100644
+--- a/src/filesystem/filesystem.cpp
++++ b/src/filesystem/filesystem.cpp
+@@ -728,6 +728,34 @@ void FileSystem::openRead(OpenHandler &handler, const char *filename) {
+     PHYSFS_enumerate(dir, openReadEnumCB, &data);
+   }
+ 
++#ifdef MKXPZ_RETRO
++  // Files created during play (save previews) are absent from the startup index.
++  if (p->havePathCache && data.matchCount == 0 && !data.physfsError &&
++      PHYSFS_exists(filename_nm.c_str())) {
++    OpenReadEnumData exact(handler, filename_nm.c_str(), filename_nm.size(), nullptr);
++    openReadEnumCB(&exact, "", filename_nm.c_str());
++    data.matchCount = exact.matchCount;
++    data.physfsError = exact.physfsError;
++  }
++  if (p->havePathCache && data.matchCount == 0 && !data.physfsError) {
++    // Refresh just this directory when writable files were added after startup.
++    const size_t slash = filename_nm.find_last_of('/');
++    std::string parent = slash == std::string::npos ? "" : filename_nm.substr(0, slash);
++    parent = desensitize(parent.c_str());
++    struct Refresh { FileSystemPrivate *p; OpenReadEnumData *data; } refresh { p, &data };
++    PHYSFS_enumerate(parent.c_str(), [](void *ctx, const char *directory, const char *name) {
++      auto &r = *static_cast<Refresh *>(ctx);
++      std::string actual = std::string(directory) + '/' + name;
++      std::string key = actual, dir_key = directory, name_key = name;
++      strTolower(key); strTolower(dir_key); strTolower(name_key);
++      r.p->pathCache.insert(key, actual);
++      auto &names = r.p->fileLists[dir_key];
++      if (std::find(names.begin(), names.end(), name_key) == names.end()) names.push_back(name_key);
++      return openReadEnumCB(r.data, dir_key.c_str(), name_key.c_str());
++    }, &refresh);
++  }
++#endif
++
+   if (data.physfsError)
+     handler.exception = Exception(Exception::PHYSFSError, "PhysFS: %s", data.physfsError);
+   else if (data.matchCount == 0)
+diff --git a/src/input/input-retro.cpp b/src/input/input-retro.cpp
+index d292425..116ca7c 100644
+--- a/src/input/input-retro.cpp
++++ b/src/input/input-retro.cpp
+@@ -1520,6 +1520,12 @@ uint8_t *Input::rawKeyStates()
+     return p->rawKeyStates;
+ }
+ 
++bool Input::physicalKeyState(unsigned int scancode)
++{
++    return scancode < NUM_SCANCODES && scancodeToRetrok[scancode] != RETROK_UNKNOWN
++        && p->keyboardStates[scancodeToRetrok[scancode]];
++}
++
+ unsigned int Input::rawKeyStatesLength()
+ {
+     return NUM_SCANCODES;
+@@ -1547,7 +1553,25 @@ unsigned int Input::rawAxesLength()
+ 
+ short Input::getControllerAxisValue(SDL_GameControllerAxis axis)
+ {
+-    return 0; // TODO
++    if (!mkxp_retro::input_state)
++        return 0;
++    switch (axis)
++    {
++        case SDL_CONTROLLER_AXIS_LEFTX:
++        case SDL_CONTROLLER_AXIS_LEFTY:
++            return mkxp_retro::input_state(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT,
++                axis == SDL_CONTROLLER_AXIS_LEFTX ? RETRO_DEVICE_ID_ANALOG_X : RETRO_DEVICE_ID_ANALOG_Y);
++        case SDL_CONTROLLER_AXIS_RIGHTX:
++        case SDL_CONTROLLER_AXIS_RIGHTY:
++            return mkxp_retro::input_state(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT,
++                axis == SDL_CONTROLLER_AXIS_RIGHTX ? RETRO_DEVICE_ID_ANALOG_X : RETRO_DEVICE_ID_ANALOG_Y);
++        case SDL_CONTROLLER_AXIS_TRIGGERLEFT:
++            return p->rawButtonStates[SDL_CONTROLLER_BUTTON_PADDLE1] ? 32767 : 0;
++        case SDL_CONTROLLER_AXIS_TRIGGERRIGHT:
++            return p->rawButtonStates[SDL_CONTROLLER_BUTTON_PADDLE2] ? 32767 : 0;
++        default:
++            return 0;
++    }
+ }
+ 
+ int Input::dir4Value()
+diff --git a/src/input/input.h b/src/input/input.h
+index 82003b0..3c5013d 100644
+--- a/src/input/input.h
++++ b/src/input/input.h
+@@ -160,6 +160,7 @@ public:
+     double controllerRepeatTimeEx(int button);
+     
+     uint8_t *rawKeyStates();
++    bool physicalKeyState(unsigned int scancode);
+     unsigned int rawKeyStatesLength();
+     uint8_t *rawButtonStates();
+     unsigned int rawButtonStatesLength();

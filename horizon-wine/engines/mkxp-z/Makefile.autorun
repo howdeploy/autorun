@@ -1,0 +1,9 @@
+# Loaded after the native fork's Makefile.libnx; keep its core and build flags.
+AUTORUN_MKXP_OBJECT := /output/autorun-mkxp-main.o
+OFILES += $(AUTORUN_MKXP_OBJECT)
+LDFLAGS += -Wl,--wrap=main
+
+$(OUTPUT).elf: $(AUTORUN_MKXP_OBJECT) libretro_libnx.a
+
+$(AUTORUN_MKXP_OBJECT): /integration/engines/mkxp-z/main.c /integration/source/native_mkxp.h
+	$(CC) $(CFLAGS) -std=gnu11 -I/integration/source -c $< -o $@

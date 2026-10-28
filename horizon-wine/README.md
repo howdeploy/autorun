@@ -50,6 +50,11 @@ programs and default settings into the release zip,
 
 ## Quick build
 
+The fork also has an optional [native mkxp-z module](engines/mkxp-z/README.md)
+for RPG Maker XP/VX/VX Ace content. It uses our existing Horizon engine fork
+through a separate NRO, selected from the same game library, without Wine.
+Its module build and game compatibility are separate from the Windows runtime.
+
 From the repository root, with the requirements in
 [technical.md](../documentation/technical.md#building). The Switch build runs in
 the [switch-dev](https://github.com/autorunhq/switch-dev) image named in

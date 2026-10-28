@@ -475,7 +475,9 @@ static int describe_program( struct launcher *l, struct program *p, const char *
     if ((size_t)snprintf( p->path, sizeof(p->path), "%s", path ) >= sizeof(p->path)) return 0;
     if (!launcher_dos_path( path, p->dos, sizeof(p->dos) )) return 0;
     if (l->options->machine_of( path, &p->machine )) return 0;
-    launcher_pe_describe( path, 0, NULL, p->resource_title, sizeof(p->resource_title) );
+    if (p->machine == NATIVE_MKXP_MACHINE)
+        native_mkxp_describe( path, p->resource_title, sizeof(p->resource_title) );
+    else launcher_pe_describe( path, 0, NULL, p->resource_title, sizeof(p->resource_title) );
     load_program_settings( l, p );
     return 1;
 }
@@ -497,7 +499,9 @@ static void describe_catalog_program( struct launcher *l, struct program *p,
     p->added = 1;
     if (file_exists( p->path ) && !l->options->machine_of( p->path, &p->machine ))
     {
-        launcher_pe_describe( p->path, 0, NULL, p->resource_title, sizeof(p->resource_title) );
+        if (p->machine == NATIVE_MKXP_MACHINE)
+            native_mkxp_describe( p->path, p->resource_title, sizeof(p->resource_title) );
+        else launcher_pe_describe( p->path, 0, NULL, p->resource_title, sizeof(p->resource_title) );
         load_program_settings( l, p );
     }
     else p->missing = 1;
@@ -2015,7 +2019,7 @@ static int start_program( struct launcher *l, struct program *p, char *target, s
 {
     struct ui *ui = &l->ui;
     char path[512], setup[640];
-    enum launcher_fixes_start fix_start;
+    enum launcher_fixes_start fix_start = LAUNCHER_FIXES_CANCEL;
     int api;
 
     if (!file_exists( p->path ) || l->options->machine_of( p->path, &p->machine ))
@@ -2023,6 +2027,15 @@ static int start_program( struct launcher *l, struct program *p, char *target, s
         p->missing = 1;
         ui_message( ui, "Game unavailable", "The executable is missing or is not supported by this build." );
         return 0;
+    }
+    if (p->machine == NATIVE_MKXP_MACHINE)
+    {
+        if (!l->options->schedule_restart || !native_mkxp_module_ready())
+        {
+            ui_message( ui, "mkxp-z unavailable", "Install our mkxp-z module at sdmc:/switch/wine/engines/mkxp-z/mkxp-z.nro and start Autorun through its forwarder or homebrew loader." );
+            return 0;
+        }
+        goto ready;
     }
     if (!address_space_fits( l, p ))
     {
@@ -2058,6 +2071,7 @@ static int start_program( struct launcher *l, struct program *p, char *target, s
             (api == 12 && p->settings.dxvk_source == DXVK_SOURCE_SAREK)) return 0;
     }
     if (p->settings.d3d != LAUNCHER_D3D_WINE && !prepare_program_graphics( l, p )) return 0;
+ready:
     p->missing = 0;
     p->launched_order = l->catalog.next_order++;
     save_library( l );
@@ -2393,6 +2407,7 @@ static int program_menu_run( struct launcher *l, struct program *p, char *target
     {
         const char *base = file_name( p->path );
         int in_library = find_program( l, p->path ) >= 0;
+        int native = native_mkxp_name( p->path );
         int x86 = p->machine == 0x014c, x64 = p->machine == 0x8664, dxvk_beside, dxvk_ready;
         struct dxvk_version dxvk, vkd3d;
 #ifdef WINE_NX_LSFG
@@ -2690,15 +2705,32 @@ static int program_menu_run( struct launcher *l, struct program *p, char *target
         }
 #undef ADD_ROW
 
-        launcher_game_settings_load( game, l->options->runtime_dir, p->path, p->machine );
-        count += launcher_game_settings_rows( game, rows + count, ids + count, SECTION_GAME, PROGRAM_ROWS );
-        action = ui_settings_run( ui, &list, "Game Settings", p->title, sections,
-                                  sizeof(sections) / sizeof(sections[0]) - !game->profile, rows, count, 1, &section );
+        if (native)
+        {
+            int kept = 0;
+            for (i = 0; i < count; i++)
+                if (ids[i] == ROW_START || ids[i] == ROW_FAVORITE || ids[i] == ROW_ARTWORK ||
+                    ids[i] == ROW_TITLE || ids[i] == ROW_HIDE || ids[i] == ROW_LIBRARY || ids[i] == ROW_LOCATE)
+                {
+                    rows[kept] = rows[i];
+                    rows[kept].group = 0;
+                    ids[kept++] = ids[i];
+                }
+            count = kept;
+            action = ui_list_run( ui, &list, "mkxp-z", p->title, rows, count, 1 );
+        }
+        else
+        {
+            launcher_game_settings_load( game, l->options->runtime_dir, p->path, p->machine );
+            count += launcher_game_settings_rows( game, rows + count, ids + count, SECTION_GAME, PROGRAM_ROWS );
+            action = ui_settings_run( ui, &list, "Game Settings", p->title, sections,
+                                      sizeof(sections) / sizeof(sections[0]) - !game->profile, rows, count, 1, &section );
+        }
         if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return 0;
         /* The screen shows one section at a time, so the row it chose is the
          * selection counted within that section. */
         for (id = 0, i = 0; i < count; i++)
-            if (rows[i].group == section && id++ == list.selection) break;
+            if ((native || rows[i].group == section) && id++ == list.selection) break;
         id = i < count ? ids[i] : ids[0];
         if (id >= ROW_INPUT && id <= ROW_INPUT_END)
         {
@@ -3659,7 +3691,8 @@ static int read_dir( struct launcher *l, const char *dir, int *count, int images
         {
             const char *extension = strrchr( entry->d_name, '.' );
             if (images ? (!extension || (strcasecmp( extension, ".png" ) && strcasecmp( extension, ".jpg" ) &&
-                                        strcasecmp( extension, ".jpeg" ))) : !launcher_is_exe( entry->d_name )) continue;
+                                        strcasecmp( extension, ".jpeg" ))) :
+                !launcher_is_exe( entry->d_name ) && !native_mkxp_name( entry->d_name )) continue;
         }
         snprintf( file->name, sizeof(file->name), "%s", entry->d_name );
         file->supported = images || file->is_dir || !l->options->machine_of( path, &file->machine );

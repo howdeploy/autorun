@@ -16,6 +16,7 @@
 #include <string.h>
 #include <strings.h>
 #include "dxvk_releases.h"
+#include "launcher_list.h"
 
 #define LAUNCHER_KV_MAX 8192
 
@@ -348,12 +349,7 @@ static inline int launcher_vkd3d_version_directory( unsigned short machine, cons
 
 static inline int launcher_settings_path( const char *exe_path, char *out, size_t size )
 {
-    size_t len = strlen( exe_path ), suffix_size = sizeof(".wine-nx.txt");
-
-    if (len < 4 || strcasecmp( exe_path + len - 4, ".exe" ) || len - 4 + suffix_size > size) return 0;
-    memcpy( out, exe_path, len - 4 );
-    memcpy( out + len - 4, ".wine-nx.txt", suffix_size );
-    return 1;
+    return launcher_sibling_path( exe_path, ".wine-nx.txt", out, size );
 }
 
 static inline int launcher_settings_on_usb( const char *exe_path )

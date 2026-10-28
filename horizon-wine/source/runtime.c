@@ -2596,6 +2596,12 @@ static NTSTATUS runtime_target_machine( const char *path, USHORT *machine )
 
 static int launcher_machine( const char *path, unsigned short *machine )
 {
+    if (native_mkxp_name( path ))
+    {
+        if (!native_mkxp_describe( path, NULL, 0 )) return 1;
+        *machine = NATIVE_MKXP_MACHINE;
+        return 0;
+    }
     return runtime_target_machine( path, machine ) != STATUS_SUCCESS;
 }
 
@@ -4035,7 +4041,7 @@ int main( int argc, char **argv )
     /* First, before anything else: which build this is and which file it was
      * started from. Without it a log from an older NRO on the card reads just
      * like one from the new one. */
-    log_line( "[BUILD] %s howdeploy/main-nv1 from %s (address space %d bits)", WINE_NX_RUNTIME_BUILD, own_nro,
+    log_line( "[BUILD] %s howdeploy/main-mkxp1 from %s (address space %d bits)", WINE_NX_RUNTIME_BUILD, own_nro,
               runtime_address_space_bits() );
     log_line( "[LOWVA] forwarder title %016llx", runtime_title_id() );
     low_window_available = wine_nx_low_window_probe( log_line_plain );
@@ -4159,7 +4165,8 @@ int main( int argc, char **argv )
      * DLLs from an earlier release that do not match this runtime, Wine could
      * only stop in the loader, and on the screen that is a black one. The
      * launcher offers them instead. */
-    if (forwarded_game > 0 || resumed_program || (!forwarded_game && argc > 1 && argv[1] && argv[1][0]))
+    if ((forwarded_game > 0 || resumed_program || (!forwarded_game && argc > 1 && argv[1] && argv[1][0])) &&
+        !native_mkxp_name( !forwarded_game && !resumed_program ? argv[1] : target ))
     {
         char why[160];
 
@@ -4176,7 +4183,7 @@ int main( int argc, char **argv )
     /* A game started from its forwarder never meets the launcher, which is
      * what asks about its fix: one it may not start without, not applied, has
      * it open the launcher instead. */
-    if (forwarded_game > 0)
+    if (forwarded_game > 0 && !native_mkxp_name( target ))
     {
         static char fix_error[256];
         struct game_fixes_index fixes;
@@ -4294,6 +4301,27 @@ int main( int argc, char **argv )
             return 0;
         }
         autorun = 1;
+    }
+
+    if (native_mkxp_name( target ))
+    {
+        char args[1024];
+        Result rc;
+
+        if (!native_mkxp_describe( target, NULL, 0 ) || !native_mkxp_module_ready() ||
+            !native_mkxp_arguments( target, args, sizeof(args) ) || !envHasNextLoad())
+        {
+            log_line( "[MKXP] Cannot start content or module: %s", target );
+            rc = MAKERESULT( Module_Libnx, LibnxError_BadInput );
+        }
+        else
+        {
+            rc = envSetNextLoad( NATIVE_MKXP_NRO, args );
+            log_line( "[MKXP] Handoff to %s: %s (0x%x)", NATIVE_MKXP_NRO, target, rc );
+        }
+        consoleExit( NULL );
+        leave_cleanly();
+        return R_FAILED( rc );
     }
 
     run_components_first( target, sizeof(target) );

@@ -10,6 +10,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
+#include "native_mkxp.h"
 
 static inline const char *launcher_machine_name( unsigned short machine )
 {
@@ -18,6 +19,7 @@ static inline const char *launcher_machine_name( unsigned short machine )
     case 0x014c: return "x86";
     case 0x8664: return "x64";
     case 0xaa64: return "ARM64";
+    case NATIVE_MKXP_MACHINE: return "mkxp-z";
     default: return "Unknown";
     }
 }
@@ -98,15 +100,20 @@ static inline int launcher_args_match( const char *args, const char *dos )
     return !strncasecmp( args, dos, len ) && (!args[len] || args[len] == ' ' || args[len] == '\t');
 }
 
-/* A program's own file lives next to it, named after it with suffix in place of
- * .exe. Returns 0 when the path does not end in .exe or does not fit. */
+/* Sidecars replace .exe, or append to native content's full filename. */
 static inline int launcher_sibling_path( const char *exe_path, const char *suffix, char *out, size_t size )
 {
     size_t len = strlen( exe_path ), suffix_size = strlen( suffix ) + 1;
 
-    if (len < 4 || strcasecmp( exe_path + len - 4, ".exe" ) || len - 4 + suffix_size > size) return 0;
-    memcpy( out, exe_path, len - 4 );
-    memcpy( out + len - 4, suffix, suffix_size );
+    /* Keep Game.ini separate from the same game's Game.exe settings. */
+    if (!native_mkxp_name( exe_path ))
+    {
+        if (len < 4 || strcasecmp( exe_path + len - 4, ".exe" )) return 0;
+        len -= 4;
+    }
+    if (len + suffix_size > size) return 0;
+    memcpy( out, exe_path, len );
+    memcpy( out + len, suffix, suffix_size );
     return 1;
 }
 

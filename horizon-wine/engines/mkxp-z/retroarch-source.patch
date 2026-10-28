@@ -1,0 +1,249 @@
+diff --git a/audio/drivers/switch_audio.c b/audio/drivers/switch_audio.c
+index 2db183a..35346d5 100644
+--- a/audio/drivers/switch_audio.c
++++ b/audio/drivers/switch_audio.c
+@@ -324,7 +324,7 @@ static void *switch_audio_init(const char *device,
+    swa->latency        = latency;
+    swa->last_append    = svcGetSystemTick();
+ 
+-   swa->blocking       = block_frames;
++   swa->blocking       = true;
+    swa->is_paused      = true;
+ 
+    RARCH_LOG("[Switch audio] Audio initialized.\n");
+diff --git a/audio/drivers/switch_libnx_audren_audio.c b/audio/drivers/switch_libnx_audren_audio.c
+index 7d9e9a4..2a712a5 100644
+--- a/audio/drivers/switch_libnx_audren_audio.c
++++ b/audio/drivers/switch_libnx_audren_audio.c
+@@ -81,7 +81,7 @@ static void *libnx_audren_audio_init(
+    real_latency = MAX(5, latency);
+    RARCH_LOG("[Audren] real_latency is %u.\n", real_latency);
+ 
+-   aud->nonblock     = !block_frames;
++   aud->nonblock     = false;
+    aud->buffer_size  = (real_latency * sample_rate / 1000);
+    aud->samples      = (aud->buffer_size / num_channels / sizeof(int16_t));
+    aud->current_size = 0;
+diff --git a/audio/drivers/switch_libnx_audren_thread_audio.c b/audio/drivers/switch_libnx_audren_thread_audio.c
+index f92b322..969b100 100644
+--- a/audio/drivers/switch_libnx_audren_thread_audio.c
++++ b/audio/drivers/switch_libnx_audren_thread_audio.c
+@@ -162,7 +162,7 @@ static void *libnx_audren_thread_audio_init(const char *device, unsigned rate, u
+ 
+    aud->running     = true;
+    aud->paused      = false;
+-   aud->nonblock    = !block_frames;
++   aud->nonblock    = false;
+    aud->buffer_size = (real_latency * sample_rate / 1000);
+    aud->samples     = (aud->buffer_size / num_channels / sizeof(int16_t));
+ 
+diff --git a/audio/drivers/switch_thread_audio.c b/audio/drivers/switch_thread_audio.c
+index 927a63b..6e8310e 100644
+--- a/audio/drivers/switch_thread_audio.c
++++ b/audio/drivers/switch_thread_audio.c
+@@ -153,7 +153,7 @@ static void *switch_thread_audio_init(const char *device, unsigned rate, unsigne
+       return NULL;
+ 
+    swa->running     = true;
+-   swa->nonblock    = true;
++   swa->nonblock    = false;
+    swa->is_paused   = true;
+    swa->latency     = MAX(latency, 8);
+ 
+diff --git a/frontend/drivers/platform_switch.c b/frontend/drivers/platform_switch.c
+index b3893af..d181dfe 100644
+--- a/frontend/drivers/platform_switch.c
++++ b/frontend/drivers/platform_switch.c
+@@ -111,6 +111,129 @@ static bool psmInitialized  = false;
+ 
+ static AppletHookCookie applet_hook_cookie;
+ 
++#define LONA_LOADING_CPU_HZ 1785000000U
++static bool lona_loading_requested;
++static bool lona_loading_applied;
++static u32 lona_loading_restore_hz;
++static u64 lona_loading_deadline;
++static u64 lona_loading_next_poll;
++
++static Result lona_cpu_clock(u32 *hz, bool write)
++{
++   ClkrstSession session = {0};
++   Result rc = clkrstOpenSession(&session, PcvModuleId_CpuBus, 3);
++   if (R_SUCCEEDED(rc))
++   {
++      rc = write ? clkrstSetClockRate(&session, *hz)
++                 : clkrstGetClockRate(&session, hz);
++      clkrstCloseSession(&session);
++   }
++   return rc;
++}
++
++static int lona_restore_cpu(const char *reason)
++{
++   u32 actual = 0;
++   Result rc;
++   if (!lona_loading_applied)
++      return 1;
++   rc = lona_cpu_clock(&actual, false);
++   if (R_SUCCEEDED(rc) && actual != LONA_LOADING_CPU_HZ)
++   {
++      RARCH_LOG("[Lona CPU] External clock change: %u Hz; relinquishing boost.\n", actual);
++      lona_loading_applied = false;
++      lona_loading_requested = false;
++      return 1;
++   }
++   rc = lona_cpu_clock(&lona_loading_restore_hz, true);
++   if (R_SUCCEEDED(rc))
++      rc = lona_cpu_clock(&actual, false);
++   if (R_FAILED(rc) || actual != lona_loading_restore_hz)
++   {
++      RARCH_ERR("[Lona CPU] Restore failed (%s): rc=0x%x, actual=%u, expected=%u Hz.\n",
++            reason, rc, actual, lona_loading_restore_hz);
++      return 0;
++   }
++   lona_loading_applied = false;
++   RARCH_LOG("[Lona CPU] Restored %u Hz (%s).\n", actual, reason);
++   return 1;
++}
++
++int mkxp_switch_set_loading_boost(int enabled)
++{
++   u32 target = LONA_LOADING_CPU_HZ;
++   u32 actual = 0;
++   Result rc;
++   if (!enabled)
++   {
++      lona_loading_requested = false;
++      return lona_restore_cpu("loading ended");
++   }
++   if (hosversionBefore(8, 0, 0) || !platform_switch_has_focus)
++      return 0;
++   if (lona_loading_requested && armGetSystemTick() >= lona_loading_deadline)
++   {
++      lona_loading_requested = false;
++      lona_restore_cpu("10 minute limit");
++      return 0;
++   }
++   if (lona_loading_applied)
++      return 1;
++   if (!lona_loading_requested)
++   {
++      rc = lona_cpu_clock(&lona_loading_restore_hz, false);
++      if (R_FAILED(rc))
++      {
++         RARCH_ERR("[Lona CPU] Cannot read initial clock: rc=0x%x; boost skipped.\n", rc);
++         return 0;
++      }
++      if (lona_loading_restore_hz >= target)
++      {
++         RARCH_LOG("[Lona CPU] Already at %u Hz; leaving clocks unchanged.\n", lona_loading_restore_hz);
++         return 1;
++      }
++      lona_loading_requested = true;
++      lona_loading_deadline = armGetSystemTick() + armNsToTicks(600000000000ULL);
++   }
++   rc = lona_cpu_clock(&target, true);
++   if (R_SUCCEEDED(rc))
++   {
++      lona_loading_applied = true;
++      rc = lona_cpu_clock(&actual, false);
++   }
++   if (R_FAILED(rc) || actual != target)
++   {
++      RARCH_ERR("[Lona CPU] Boost failed: rc=0x%x, actual=%u Hz.\n", rc, actual);
++      lona_loading_requested = false;
++      lona_restore_cpu("boost failed");
++      return 0;
++   }
++   RARCH_LOG("[Lona CPU] Loading boost: %u -> %u Hz (CPU only).\n", lona_loading_restore_hz, actual);
++   return 1;
++}
++
++void mkxp_switch_loading_boost_poll(void)
++{
++   u64 now = armGetSystemTick();
++   u32 actual = 0;
++   if ((!lona_loading_requested && !lona_loading_applied) || now < lona_loading_next_poll)
++      return;
++   lona_loading_next_poll = now + armNsToTicks(1000000000ULL);
++   if (lona_loading_requested && now >= lona_loading_deadline)
++   {
++      lona_loading_requested = false;
++      lona_restore_cpu("10 minute limit");
++   }
++   else if (!lona_loading_requested)
++      lona_restore_cpu("restore retry");
++   else if (lona_loading_applied && R_SUCCEEDED(lona_cpu_clock(&actual, false)) && actual != LONA_LOADING_CPU_HZ)
++   {
++      RARCH_LOG("[Lona CPU] External clock change: %u Hz; relinquishing boost.\n", actual);
++      lona_loading_requested = false;
++      lona_loading_applied = false;
++   }
++}
++
+ #ifdef NXLINK
+ extern bool nxlink_connected;
+ #endif
+@@ -122,6 +245,9 @@ void libnx_apply_overclock(void)
+    settings_t *settings        = config_get_ptr();
+    unsigned libnx_overclock    = settings->uints.libnx_overclock;
+ 
++   if (lona_loading_requested && mkxp_switch_set_loading_boost(1))
++      return;
++
+    if (libnx_overclock >= 0 && libnx_overclock <= profiles_count)
+    {
+       if (hosversionBefore(8, 0, 0))
+@@ -157,6 +283,7 @@ static void on_applet_hook(AppletHookType hook, void *param)
+ 
+          if (!platform_switch_has_focus)
+          {
++            lona_restore_cpu("focus lost");
+             if (hosversionBefore(8, 0, 0))
+             {
+                pcvSetClockRate(PcvModule_CpuBus, 1020000000);
+@@ -303,7 +430,7 @@ static void frontend_switch_get_env(
+    }
+ 
+    fill_pathname_join(g_defaults.path_config,
+-         g_defaults.dirs[DEFAULT_DIR_PORT],
++         "romfs:/retroarch",
+          FILE_PATH_MAIN_CONFIG,
+          sizeof(g_defaults.path_config));
+ 
+@@ -317,6 +444,7 @@ static void frontend_switch_deinit(void *data)
+    (void)data;
+ 
+ #ifdef HAVE_LIBNX
++   mkxp_switch_set_loading_boost(0);
+    nifmExit();
+ 
+    if (hosversionBefore(8, 0, 0))
+diff --git a/retroarch.c b/retroarch.c
+index b167283..e5c9a29 100644
+--- a/retroarch.c
++++ b/retroarch.c
+@@ -6191,7 +6191,7 @@ void emscripten_mainloop(void)
+ extern "C"
+ #endif
+ int main(int argc, char *argv[])
+-{
++{ { static char *bootstrap_argv[] = {NULL, NULL, NULL}; bootstrap_argv[0] = strdup("retroarch"); romfsInit(); { /* LonaRPG port: romfs:/bootstrap_path.txt may point to a game on the SD card */ char game_path[512] = "romfs:/Game.mkxpz"; FILE *bp = fopen("romfs:/bootstrap_path.txt", "r"); if (bp) { if (fgets(game_path, sizeof(game_path), bp)) game_path[strcspn(game_path, "\r\n")] = 0; fclose(bp); } bootstrap_argv[1] = strdup(game_path); } argc = 2; argv = bootstrap_argv; }
+    return rarch_main(argc, argv, NULL);
+ }
+ #endif
+diff --git a/runloop.c b/runloop.c
+index 679517b..219ccc4 100644
+--- a/runloop.c
++++ b/runloop.c
+@@ -5625,6 +5625,10 @@ static enum runloop_state_enum runloop_check_state(
+    /* Should be called once per frame */
+    if (!appletMainLoop())
+       return RUNLOOP_STATE_QUIT;
++   {
++      extern void mkxp_switch_loading_boost_poll(void);
++      mkxp_switch_loading_boost_poll();
++   }
+ #endif
+ 
+ #ifdef _3DS

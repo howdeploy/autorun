@@ -23,7 +23,7 @@ struct wine_nx_launcher_options
      * 0 the real one, -1 when Atmosphere did not say. */
     int emummc;
     const char *build;
-    /* 0 with the program's IMAGE_FILE_MACHINE_* when this runtime can start it. */
+    /* 0 with IMAGE_FILE_MACHINE_* or NATIVE_MKXP_MACHINE for supported content. */
     int (*machine_of)( const char *path, unsigned short *machine );
     int (*list_usb)( struct wine_nx_launcher_usb_volume *volumes, int max );
     int vulkan;                /* the runtime has Vulkan for DXVK */
