@@ -76,3 +76,22 @@ rejected. A build-time assertion bounds the command line against the loader's
 argument buffer. No console launch or gameplay validation is implied by the
 source integration; validate start, input, sound, save/load and return on the
 console before treating another game as supported.
+
+## Installation status: 2026-10-28
+
+Both NROs built successfully using the existing native core and runtime
+dependencies. Inspection of the module's ELF confirms that `_start` branches
+to `__wrap_main`. FTP staging and final readback matched these SHA-256 values:
+
+| File | SHA-256 |
+|---|---|
+| `wine-nx-runtime.nro` | `c205bb664d421ebb579e3b05488d4a5d3eee1a827e2574cb5cdddf5aeb1f1a56` |
+| `engines/mkxp-z/mkxp-z.nro` | `dbbb331f14375330f3efe18b8f5c14e1680fe759401f545a145b521e3bb00cb8` |
+
+Library entry 3 selects `sdmc:/mkxp/LonaRPG.mkxpz`; entries 1 and 2 were
+preserved. The old runtime and library have SD backups with suffix
+`.before-mkxp-20261028-182900` and local backups. Fallout's settings, Wine's
+quartz/dsound and the DLL manifest retain their pre-install hashes.
+The existing native content is outside Autorun's FTP root and was not read
+back in this installation. No game, input, sound, save/load or return to
+Autorun was exercised through the new integration.
