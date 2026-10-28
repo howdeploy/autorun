@@ -459,6 +459,8 @@ static void load_program_settings( struct launcher *l, struct program *p )
     if (launcher_sibling_path( p->path, ".box64.txt", path, sizeof(path) )) p->own_files |= file_exists( path );
 
     if (p->settings.title[0]) snprintf( p->title, sizeof(p->title), "%s", p->settings.title );
+    else if (p->machine == NATIVE_MKXP_MACHINE && p->resource_title[0])
+        snprintf( p->title, sizeof(p->title), "%s (mkxp-z)", p->resource_title );
     else if (p->resource_title[0]) snprintf( p->title, sizeof(p->title), "%s", p->resource_title );
     else if (!folder_title( p->path, p->title, sizeof(p->title) ))
     {

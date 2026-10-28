@@ -16,7 +16,8 @@ int __wrap_main( int argc, char *argv[] )
                     "mkxp-z handoff must fit the homebrew loader argument buffer" );
     if (argc == 3 && !strcmp( argv[1], "--autorun" ) && native_mkxp_describe( argv[2], NULL, 0 ))
     {
-        char *content_argv[] = { "retroarch", argv[2], NULL };
+        /* This frontend's realpath treats only slash-prefixed paths as absolute. */
+        char *content_argv[] = { "retroarch", argv[2] + 5, NULL };
         Result rc = romfsInit();
 
         if (log) { fprintf( log, "[MKXP] content=%s romfs=0x%x\n", argv[2], rc ); fflush( log ); }

@@ -34,7 +34,7 @@ docker run --rm --user "$(id -u):$(id -g)" \
     -v "$output_dir":/output -v "$integration_root":/integration:ro \
     -w /output/retroarch mkxp-libnx-build:v4-10-0 bash -euc '
     make -f Makefile.libnx -f /integration/engines/mkxp-z/Makefile.autorun \
-        LIBRETRO=mkxp-z TARGET=/output/mkxp-z NO_ICON=1 NO_NACP=1 /output/mkxp-z.elf -j"$(nproc)"
+        LIBRETRO=mkxp-z OUTPUT=/output/mkxp-z NO_ICON=1 NO_NACP=1 /output/mkxp-z.elf -j"$(nproc)"
     /opt/devkitpro/devkitA64/bin/aarch64-none-elf-strip -o /output/mkxp-z.stripped.elf /output/mkxp-z.elf
     /opt/devkitpro/tools/bin/nacptool --create "mkxp-z (Autorun)" "mkxp-z / libretro contributors" "native-1" /output/mkxp-z.nacp
     /opt/devkitpro/tools/bin/elf2nro /output/mkxp-z.stripped.elf /output/mkxp-z.nro \

@@ -29,7 +29,7 @@ compatibility scripts; recognizing XP/VX/VX Ace content does not establish
 compatibility with every game's scripts or DLL calls.
 
 An ordinary exit returns to Autorun. Closing the application through HOME
-ends it directly. Handoff diagnostics are in `switch/wine/autorun_runtime.log`
+ends it directly. Handoff diagnostics are in `switch/wine/logs/autorun_runtime.log`
 and `switch/wine/mkxp-z-module.log`; core diagnostics remain under `/mkxp/logs`.
 The native save directory remains `/mkxp/saves`, using the same RetroArch
 configuration and title-based overlay as the standalone port. Different games
