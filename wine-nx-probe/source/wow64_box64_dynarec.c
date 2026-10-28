@@ -28,6 +28,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -498,6 +499,13 @@ static void apply_box64_options(void)
     if (&wine_nx_runtime_trace) wine_nx_runtime_trace( message );
 }
 
+#ifdef WINE_NX_BOX64_CHECK_CODE
+/* The options the checked phase turns off, restored when it ends. */
+static int check_saved_callret, check_saved_bigblock, check_saved_forward;
+static int guest_code_readable( void *addr, uintptr_t size );
+void wine_nx_box64_invalidate( uintptr_t addr, size_t size, int destroy );
+#endif
+
 static void init_box64_env(void)
 {
     /* Box64's own defaults for every option, then the CPU this backend
@@ -543,7 +551,98 @@ static void init_box64_env(void)
      * launcher's default, rather than Box64's 4096 translations. */
     box64env.dynarec_purge_age = 1000;
     apply_box64_options();
+#ifdef WINE_NX_BOX64_CHECK_CODE
+    /* Checked entries must not be bypassed by native returns or large block chains. */
+    check_saved_callret = box64env.dynarec_callret;
+    check_saved_bigblock = box64env.dynarec_bigblock;
+    check_saved_forward = box64env.dynarec_forward;
+    box64env.dynarec_callret = 0;
+    box64env.dynarec_bigblock = 0;
+    box64env.dynarec_forward = 0;
+    if (&wine_nx_runtime_trace)
+        wine_nx_runtime_trace( "[DYNAREC] checked phase: every block entry validated until RGSS is loaded; CALLRET=0 BIGBLOCK=0 FORWARD=0" );
+#endif
 }
+
+#ifdef WINE_NX_BOX64_CHECK_CODE
+/* RGSS3 unpacks and patches its own code without flushing it, but only while
+ * its DLL loads (lonarpg/experiments/02-rgss-resolver): until then every block
+ * entry checks its code's hash. Afterwards its main code stays put, and the Ruby VM
+ * inside it -- where such games spend their time -- runs as plain blocks with
+ * the options the checked phase turned off. The section holding the DLL's
+ * entry point is its protector (.vxdata in RGSS301), which keeps rewriting
+ * itself whenever RGSS calls it, also inside a block it is running: entry
+ * checks miss that, so that section is left to the interpreter for good. */
+int wine_nx_box64_check_code = 1;
+uintptr_t wine_nx_box64_check_lo, wine_nx_box64_check_hi;
+
+void wine_nx_box64_code_settled( uintptr_t base, const char *name )
+{
+    const uint8_t *image = (const uint8_t *)base;
+    uint32_t lfanew, size = 0, entry = 0, lo = 0, hi = 0;
+    char msg[256];
+
+    if (!dynarec_ready || !__atomic_load_n( &wine_nx_box64_check_code, __ATOMIC_ACQUIRE )) return;
+    /* SizeOfImage from the PE headers, which the loader mapped readable. */
+    if (guest_code_readable( (void *)base, 0x40 ) && image[0] == 'M' && image[1] == 'Z' &&
+        (lfanew = *(const uint32_t *)(image + 0x3c)) < 0x1000 && guest_code_readable( (void *)(base + lfanew), 0x54 ) &&
+        !memcmp( image + lfanew, "PE\0\0", 4 ))
+    {
+        uint16_t sections = *(const uint16_t *)(image + lfanew + 6);
+        uint16_t optional = *(const uint16_t *)(image + lfanew + 0x14);
+        const uint8_t *table = image + lfanew + 0x18 + optional;
+        unsigned int i;
+
+        size = *(const uint32_t *)(image + lfanew + 0x50);
+        entry = *(const uint32_t *)(image + lfanew + 0x28);
+        if (sections <= 96 && guest_code_readable( (void *)table, sections * 40u ))
+            for (i = 0; i < sections; i++)
+            {
+                uint32_t va = *(const uint32_t *)(table + i * 40 + 12);
+                uint32_t vsize = *(const uint32_t *)(table + i * 40 + 8);
+                uint32_t raw = *(const uint32_t *)(table + i * 40 + 16);
+                uint32_t end = va + (vsize > raw ? vsize : raw);
+
+                if (entry >= va && entry < end && end <= size)
+                {
+                    lo = va;
+                    hi = end;
+                }
+            }
+    }
+
+    /* Without a known entry section, the whole image stays checked. */
+    if (!hi && size) hi = size;
+
+    /* The translator reads these during its passes, which must agree. */
+    mutex_lock( &my_context->mutex_dyndump );
+    if (hi)
+    {
+        wine_nx_box64_check_lo = base + lo;
+        wine_nx_box64_check_hi = base + hi;
+        box64env.nodynarec_start = base + lo;
+        box64env.nodynarec_end = base + hi;
+    }
+    __atomic_store_n( &wine_nx_box64_check_code, 0, __ATOMIC_RELEASE );
+    box64env.dynarec_callret = check_saved_callret;
+    box64env.dynarec_bigblock = check_saved_bigblock;
+    box64env.dynarec_forward = check_saved_forward;
+    mutex_unlock( &my_context->mutex_dyndump );
+
+    /* Translate all guest code again, not only the module: blocks of ntdll,
+     * kernel32, msvcrt or the game made during the checked phase would keep
+     * validating every entry for good, and RGSS's Ruby calls them all the time
+     * (lonarpg/logs/20261025-031522-680583-prepared-json-user-run: about a
+     * million entry checks a second after the switch). The entry section stays
+     * with the interpreter; FreeDynablock locks itself. */
+    wine_nx_box64_invalidate( 0, (size_t)1 << 32, 1 );
+    snprintf( msg, sizeof(msg), "[DYNAREC] checked phase ended after %s at %#lx+%#x; all guest code retranslated; interpreted: entry section %#lx-%#lx; "
+              "CALLRET=%d BIGBLOCK=%d FORWARD=%d", name, (unsigned long)base, size,
+              (unsigned long)wine_nx_box64_check_lo, (unsigned long)wine_nx_box64_check_hi,
+              check_saved_callret, check_saved_bigblock, check_saved_forward );
+    if (&wine_nx_runtime_trace) wine_nx_runtime_trace( msg );
+}
+#endif
 
 static void init_dynarec(void)
 {

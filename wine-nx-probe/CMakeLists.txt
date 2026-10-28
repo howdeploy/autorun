@@ -763,6 +763,10 @@ endif()
 
 option(WINE_NX_BOX64_INTERPRETER "Build the Box64 interpreter adapter" OFF)
 option(WINE_NX_BOX64_DYNAREC "Use the ARM64 dynarec in the Box64 adapter" OFF)
+option(WINE_NX_BOX64_CHECK_CODE "Validate every dynarec block entry for self-modifying-code diagnosis" OFF)
+if(WINE_NX_BOX64_CHECK_CODE AND NOT WINE_NX_BOX64_DYNAREC)
+    message(FATAL_ERROR "WINE_NX_BOX64_CHECK_CODE requires WINE_NX_BOX64_DYNAREC")
+endif()
 option(WINE_NX_AMD64 "Enable AMD64 applications through Wine ARM64EC and Box64" OFF)
 if(WINE_NX_AMD64 AND NOT (WINE_NX_BOX64_INTERPRETER OR WINE_NX_BOX64_DYNAREC))
     message(FATAL_ERROR "WINE_NX_AMD64 requires WINE_NX_BOX64_INTERPRETER or WINE_NX_BOX64_DYNAREC")
@@ -772,6 +776,9 @@ if(WINE_NX_BOX64_INTERPRETER OR WINE_NX_BOX64_DYNAREC)
     if(WINE_NX_BOX64_DYNAREC)
         wine_nx_add_box64_core(wine-nx-box64-core DYNAREC)
         target_sources(wine-nx-runtime PRIVATE source/wow64_box64_dynarec.c)
+        if(WINE_NX_BOX64_CHECK_CODE)
+            target_compile_definitions(wine-nx-runtime PRIVATE WINE_NX_BOX64_CHECK_CODE)
+        endif()
     else()
         wine_nx_add_box64_core(wine-nx-box64-core)
     endif()
@@ -1056,7 +1063,7 @@ if(NACPTOOL AND ELF2NRO)
     endif()
     add_custom_command(
         OUTPUT "${RUNTIME_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "${AUTORUN_NACP_NAME}" "howdeploy + Autorun contributors" "TB4 RU4" "${RUNTIME_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "${AUTORUN_NACP_NAME}" "howdeploy + Autorun contributors" "TB4 RU15" "${RUNTIME_NACP_FILE}"
         VERBATIM
     )
 

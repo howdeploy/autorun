@@ -74,6 +74,114 @@ and [CallNextHookEx](https://learn.microsoft.com/en-us/windows/win32/api/winuser
 contracts, together with the pinned Wine `server/hook.c` and `dlls/win32u/hook.c`,
 are the implementation references.
 
+## Revision 7: distinguish display handoff and presentation
+
+The user's 500-second RU6 run reached Main and early DataManager, with
+successful keyboard callback returns. No visible menu was established.
+Aggregate frames stopped at 975; drawable swaps stayed at zero during imports.
+
+Revision 7 retains NXGL/NXCOMP in events, records entry/return for the first four
+swaps and power-of-two EGL failures, and reports swap_attempts/swap_failures.
+gl_frames now counts only successful eglSwapBuffers returns. Success does not
+prove that the buffers contain the intended game image.
+
+The paired LonaRPG working-copy patch explicitly shows its loading sprite,
+requests the initial transition and resets timing before infrequent loading
+updates. It adds bounded DataManager, Mouse/Bitmap and first-scene markers.
+The native RGSS DLL, mods, saves and HDD original are retained. This is a
+candidate fix for the invisible loading screen, not a claim of compatibility.
+
+RU7 compiled and was installed with SHA-256 readback. Loading-screen, main-menu
+and Joy-Con checks are pending. The agent ran no tests or game sessions.
+
+### Checked dynarec comparison build
+
+`-DWINE_NX_BOX64_CHECK_CODE=ON` requires `WINE_NX_BOX64_DYNAREC=ON` and builds
+`howdeploy-tb4-ru-dynarec-checked-7`. Its generated, pinned Box64 source marks
+every translated block `always_test=1`, retaining checked jump-table entries
+instead of making them clean after the first successful hash. The build forces
+CALLRET=0, BIGBLOCK=0 and FORWARD=0 after loading sidecar settings, and logs the
+effective settings. Defaults and other builds retain their existing behavior.
+
+This targets RGSS code modified without a memory-protection or instruction-cache
+notification. It is a diagnostic comparison, not complete SMC support: code
+changed inside an executing block can still escape an entry-time check. It also
+adds hash/dispatch overhead. The checked NRO was installed at the user's request
+after preserving the interpreter RU7 result. An accidental .bak mouse-script
+import was also removed, so a behavior change cannot be attributed to the CPU
+backend alone. No game launch or tests have validated this variant yet.
+
+## Revision 6: restore handled memory faults before logging
+
+The RU5 console run confirmed the quiet profile, but its event stream stopped
+after about 80 seconds while the user kept the black window open for two to five
+minutes. The last records were permission-write faults; there was no fatal
+exception verdict, Ruby marker or exit. This does not establish why logging or
+execution stopped, nor prove that the compositor caused the black window.
+
+The Horizon exception handler previously formatted and synchronously flushed
+two fault records before calling `virtual_handle_fault`, even for recoverable
+write-watch faults. Revision 6 follows the pinned Wine ARM64 signal handler:
+attempt virtual-memory repair first, count successful repairs without stdio,
+and retain the full diagnostic/guest-exception path for unresolved faults.
+`faults_handled` in the existing heartbeat reports these repairs. This reduces
+exception-context file I/O; its effect on this game's hang remains unverified.
+
+The independent stall watcher now repeats its stack snapshots every thirty
+seconds after the initial snapshots, instead of becoming silent after the
+first twenty seconds of slow startup. No CPU backend, game script or graphics
+stack change accompanies this revision. Compilation is the only execution
+validation performed by the agent; the game remains for the user's check.
+
+## Revision 5: durable diagnostic events
+
+Alongside the capped detailed session log, revision 5 writes
+`Game-…log.events.log`. It keeps the newest two 1 MiB event segments; the older
+segment ends in `.previous.log`. Each segment contains its own build/session
+header and events have monotonic millisecond timestamps. Rotation discards older
+event history; this is bounded retention, not an unlimited crash archive.
+Detailed syscall output cannot consume this event budget. The current launcher
+has `autorun_events.log`; game event files survive reopening the launcher.
+
+All three open log files are flushed by the existing 200 ms flusher. Critical
+events and Ruby failures request an immediate flush. Card errors, process death
+inside a write and bounded-lock drops can still lose data. `[LOG]` records the
+event path or failure to open it.
+
+`[PROGRESS]` is emitted every ten seconds even without new reads or frames, in
+both verbose and quiet modes. `[HZUNIMPL]` records the first unsupported server
+request and power-of-two repetition counts without requiring verbose traces.
+Hook registration and keyboard-state markers also survive quiet runs.
+`[NXHOOK] enter/return` records the first sixteen callback attempts per hook type
+and unsuccessful returns, including NTSTATUS, reply size and result. It does not
+record the keyboard-state array. Registration/delivery alone is still not proof
+that a guest callback returned successfully.
+
+ZIP reports preserve the first 4 MiB and the newest tail of oversized logs,
+within the existing 16 MiB per-file budget, with an omission marker and exact
+byte counts in `report.txt`. The exporter build is labeled separately from the
+`[BUILD]` belonging to each retained game session.
+
+### LonaRPG script diagnostics
+
+`wine-nx-probe/tools/lonarpg-diagnostics/` provides an RGSS3/Ruby-1.9-compatible
+logger and a host-side data repacker for the specifically audited 0.9.5.0.4
+bootstrap. It records `[RUBY] BEGIN/END/FAIL/TRACE`, elapsed wall-clock script time
+and up to 32 backtrace entries. Native event timestamps provide the independent
+monotonic timeline. The bootstrap starts logging before F1/F12 initialization;
+the instrumented external loader records exceptions before its existing modal
+dialog. Its rescue/continue behavior and successful return value are retained.
+
+The runtime retains these tagged stdout records beyond the ordinary 2,000-line
+stdout forwarding budget. No RGSS DLL patch, disabled mod, new graphics backend
+or CPU backend change is part of this diagnostic package.
+
+The repacker verifies the original bootstrap SHA-256, modifies only known code
+anchors, writes the patched binary and readable `LoadUp.rb` into a new output
+directory, and verifies serialization by decoding data without evaluation.
+The actual game, callbacks and ZIP export have not been executed by the agent;
+only compilation, static review and data/hash validation were performed.
+
 ## Language
 
 Russian is the initial language. Change it immediately under
@@ -128,7 +236,7 @@ local network.
 The completed ZIP also remains in `switch/wine/reports/`. Reports include up to
 64 newest `.log` files plus eligible `stdout.txt` / `stderr.txt` from `logs/`,
 limited to 16 MiB per file and 64 MiB of uncompressed log data per report. If a
-file is larger, its tail is included and recorded in `report.txt`. That text also
+file is larger, its head and tail are included and recorded in `report.txt`. That text also
 contains the runtime build, report time, UI language, global trace/profiler
 settings, address-space size, emuMMC status and skipped-file count.
 

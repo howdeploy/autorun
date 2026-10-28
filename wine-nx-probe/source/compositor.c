@@ -47,6 +47,8 @@ static struct
     int thread_ended;           /* the presenter has run its last instruction */
     int suspend;                /* an OpenGL program wants the screen */
     int suspended;              /* and the presenter has given it up */
+    int gl_paused;              /* an API call is using Mesa offscreen */
+    int gpu_idle;               /* presenter is outside all Mesa calls */
     struct wine_nx_layer *layers;
     unsigned int stack_serial;
     int cursor_x, cursor_y, cursor_visible;
@@ -276,6 +278,25 @@ void wine_nx_compositor_resume( void )
     pthread_mutex_unlock( &comp.lock );
 }
 
+void wine_nx_compositor_gl_pause( void )
+{
+    pthread_mutex_lock( &comp.lock );
+    comp.gl_paused = 1;
+    pthread_cond_signal( &comp.wake );
+    while (comp.state == STATE_STARTING ||
+           (comp.state == STATE_RUNNING && !comp.gpu_idle && !comp.suspended))
+        pthread_cond_wait( &comp.idle, &comp.lock );
+    pthread_mutex_unlock( &comp.lock );
+}
+
+void wine_nx_compositor_gl_unpause( void )
+{
+    pthread_mutex_lock( &comp.lock );
+    comp.gl_paused = 0;
+    pthread_cond_signal( &comp.wake );
+    pthread_mutex_unlock( &comp.lock );
+}
+
 /* Without the lock, for a watch that must not wait on anything the program it
  * is watching could be holding (runtime.c, stall_watch). A count read while it
  * is being written is close enough to tell a stopped screen from a busy one. */
@@ -347,6 +368,7 @@ static void *presenter_thread( void *arg )
 
     pthread_mutex_lock( &comp.lock );
     comp.state = STATE_RUNNING;
+    comp.gpu_idle = 1;
     comp.frame = 1;
     pthread_cond_broadcast( &comp.idle );
     for (;;)
@@ -356,13 +378,21 @@ static void *presenter_thread( void *arg )
         {
             if (attached)
             {
+                comp.gpu_idle = 0;
                 pthread_mutex_unlock( &comp.lock );
                 backend->detach();
                 comp_log( "[NXCOMP] screen handed to an OpenGL program" );
                 pthread_mutex_lock( &comp.lock );
                 attached = 0;
+                comp.gpu_idle = 1;
             }
             comp.suspended = 1;
+            pthread_cond_broadcast( &comp.idle );
+            pthread_cond_wait( &comp.wake, &comp.lock );
+            continue;
+        }
+        if (comp.gl_paused)
+        {
             pthread_cond_broadcast( &comp.idle );
             pthread_cond_wait( &comp.wake, &comp.lock );
             continue;
@@ -371,12 +401,15 @@ static void *presenter_thread( void *arg )
         {
             int ret;
 
+            comp.gpu_idle = 0;
             pthread_mutex_unlock( &comp.lock );
             if (!(ret = backend->attach( comp.width, comp.height, error, sizeof(error) )))
                 comp_log( "[NXCOMP] screen taken back from the OpenGL program" );
             else if (!attach_failed)
                 comp_log( "[NXCOMP] cannot take the screen back yet: %s", error );
             pthread_mutex_lock( &comp.lock );
+            comp.gpu_idle = 1;
+            pthread_cond_broadcast( &comp.idle );
             attach_failed = !!ret;
             if (ret)
             {
@@ -395,6 +428,7 @@ static void *presenter_thread( void *arg )
         }
         if (comp.quit) goto stopped;
         comp.frame = 0;
+        comp.gpu_idle = 0;
 
         /* Take the destroyed layers out, and the shown ones in stacking order. */
         dead = NULL;
@@ -501,6 +535,8 @@ static void *presenter_thread( void *arg )
 
         pthread_mutex_lock( &comp.lock );
         comp.frames++;
+        comp.gpu_idle = 1;
+        pthread_cond_broadcast( &comp.idle );
     }
 
 stopped:

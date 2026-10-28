@@ -12434,6 +12434,16 @@ void horizon_trace( const char *fmt, ... )
     __builtin_va_list args;
     FILE *f;
 
+    if (!strncmp( fmt, "[HZHOOK]", 8 ) || !strncmp( fmt, "[HZKBD]", 7 ) ||
+        !strncmp( fmt, "[HZNULL]", 8 ) || !strncmp( fmt, "[HZUNIMPL]", 10 ))
+    {
+        char message[512];
+        __builtin_va_start( args, fmt );
+        vsnprintf( message, sizeof(message), fmt, args );
+        __builtin_va_end( args );
+        wine_nx_runtime_trace( message );
+    }
+
     /* Mapping failures must survive quiet runs. Sample repeated failures so
      * an allocator retry loop cannot flood the SD card or hide the last error. */
     if (!strncmp( fmt, "[HMAP]", 6 ) && strstr( fmt, "failed" ))
@@ -14083,6 +14093,7 @@ static int horizon_server_handle_select( struct horizon_server_connection *conne
 
 static void *horizon_server_thread( void *param )
 {
+    static unsigned int unsupported_counts[512];
     struct horizon_server_connection *connection = param;
     unsigned char message[HORIZON_SERVER_FIXED_MESSAGE_SIZE];
     struct horizon_zombie *zombie;
@@ -14630,11 +14641,18 @@ static void *horizon_server_thread( void *param )
             status = horizon_server_handle_set_key_state( connection, message, request_data, header->request_size );
             break;
         default:
+        {
+            unsigned int count = (unsigned int)header->req < ARRAY_SIZE(unsupported_counts)
+                ? __atomic_add_fetch( &unsupported_counts[header->req], 1, __ATOMIC_RELAXED ) : 1;
+            if (!(count & (count - 1)))
+                horizon_trace( "[HZUNIMPL] request=%u count=%u tid=%04x size=%u reply_size=%u\n",
+                               header->req, count, connection->tid, header->request_size, header->reply_size );
             WARN( "unimplemented Horizon server request %d size %u reply_size %u.\n",
                   header->req, header->request_size, header->reply_size );
             if (connection->reply_fd != -1)
                 status = horizon_server_write_status( connection->reply_fd, HORIZON_STATUS_NOT_IMPLEMENTED );
             break;
+        }
         }
 
         free( request_data );
@@ -14860,6 +14878,8 @@ static BOOL horizon_transient_page_fault( ThreadExceptionDump *ctx )
 }
 #endif
 
+unsigned int wine_nx_handled_page_faults;
+
 void __libnx_exception_handler( ThreadExceptionDump *ctx )
 {
     EXCEPTION_RECORD rec = { 0 };
@@ -14909,6 +14929,15 @@ void __libnx_exception_handler( ThreadExceptionDump *ctx )
     else rec.ExceptionInformation[0] = EXCEPTION_READ_FAULT;
     rec.ExceptionInformation[1] = (ULONG_PTR)ctx->far.x;
 
+    /* Match Wine's ARM64 handler: repair write-watch/protection faults before
+     * touching stdio locks or the SD card from the exception context. */
+    status = virtual_handle_fault( &rec, (void *)ctx->sp.x );
+    if (!status)
+    {
+        __atomic_add_fetch( &wine_nx_handled_page_faults, 1, __ATOMIC_RELAXED );
+        goto handled;
+    }
+
     snprintf( buf, sizeof(buf),
               "[EXC] desc=0x%08x esr=0x%08x pc=0x%llx far=0x%llx sp=0x%llx lr=0x%llx kind=%s",
               ctx->error_desc, ctx->esr,
@@ -14947,7 +14976,7 @@ void __libnx_exception_handler( ThreadExceptionDump *ctx )
               (unsigned long long)ctx->cpu_gprs[18].x );
     wine_nx_runtime_trace( buf );
 
-    status = virtual_handle_fault( &rec, (void *)ctx->sp.x );
+handled:
 #if defined(__aarch64__)
     /* A fault inside a Wine __TRY block returns to its handler, as
      * handle_syscall_fault does on Unix. virtual_check_buffer_for_write and

@@ -292,6 +292,14 @@ function(wine_nx_add_box64_core target)
         "record the largest block size")
     wine_nx_box64_patch(native_source "*(uint32_t*)(block->block+block->callrets[i].offs)"
         "*(uint32_t*)DynarecMapWritableAddress(block->block+block->callrets[i].offs)" "always-dirty callret site marks")
+    if(WINE_NX_BOX64_CHECK_CODE)
+        # Preserve Box64's always-dirty jump entries and return guards, not only the initial hash,
+        # while the checked phase lasts, and in the code RGSS keeps rewriting afterwards
+        # (wine_nx_box64_code_settled in wow64_box64_dynarec.c).
+        wine_nx_box64_patch(native_source "            block->dirty = block->always_test;"
+            "            { extern int wine_nx_box64_check_code; extern uintptr_t wine_nx_box64_check_lo, wine_nx_box64_check_hi;\n              if (wine_nx_box64_check_code || (addr + 0x1000 > wine_nx_box64_check_lo && addr < wine_nx_box64_check_hi))\n                  block->always_test = 1; }\n            block->dirty = block->always_test;"
+            "validate each block entry during the checked phase")
+    endif()
     set(native_generated "${CMAKE_CURRENT_BINARY_DIR}/${target}-dynarec_native.c")
     file(WRITE "${native_generated}" "${native_source}")
 

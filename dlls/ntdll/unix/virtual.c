@@ -1144,6 +1144,8 @@ struct wine_nx_gl_profile_entry
 static struct wine_nx_gl_profile_entry wine_nx_gl_profile_entries[4096];
 unsigned int wine_nx_gl_calls;
 unsigned long long wine_nx_gl_call_time;  /* 100 ns */
+extern void wine_nx_gl_call_begin(void) __attribute__((weak));
+extern void wine_nx_gl_call_end(void) __attribute__((weak));
 
 NTSTATUS wine_nx_call_static_wow64_unix( unixlib_handle_t handle, ULONG code, void *args )
 {
@@ -1157,7 +1159,15 @@ NTSTATUS wine_nx_call_static_wow64_unix( unixlib_handle_t handle, ULONG code, vo
             code < ARRAY_SIZE(wine_nx_gl_profile_entries))
         {
             unsigned long long start = horizon_interrupt_time(), time;
-            NTSTATUS status = wine_nx_static_wow64_unix_libs[i].funcs[code]( args );
+            NTSTATUS status;
+
+            if (wine_nx_gl_call_begin && wine_nx_gl_call_end)
+            {
+                wine_nx_gl_call_begin();
+                status = wine_nx_static_wow64_unix_libs[i].funcs[code]( args );
+                wine_nx_gl_call_end();
+            }
+            else status = wine_nx_static_wow64_unix_libs[i].funcs[code]( args );
 
             time = horizon_interrupt_time() - start;
             __atomic_add_fetch( &wine_nx_gl_profile_entries[code].time, time, __ATOMIC_RELAXED );

@@ -75,10 +75,12 @@ u32 __nx_exception_ignoredebug = 1;
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
 #ifdef WINE_NX_AMD64
 #define WINE_NX_RUNTIME_BUILD "nx-amd64-box64-3"
+#elif defined(WINE_NX_BOX64_CHECK_CODE)
+#define WINE_NX_RUNTIME_BUILD "howdeploy-tb4-ru-dynarec-phased-15"
 #elif defined(WINE_NX_BOX64_DYNAREC)
-#define WINE_NX_RUNTIME_BUILD "howdeploy-tb4-ru-dynarec-4"
+#define WINE_NX_RUNTIME_BUILD "howdeploy-tb4-ru-dynarec-8"
 #else
-#define WINE_NX_RUNTIME_BUILD "howdeploy-tb4-ru-interpreter-4"
+#define WINE_NX_RUNTIME_BUILD "howdeploy-tb4-ru-interpreter-8"
 #endif
 #define MAX_RUNTIME_MODULES 64
 #define MAX_IMPORT_DEPTH 16
@@ -105,6 +107,11 @@ static FILE *log_file;
  * with it, so a program's own log is a file of its own, which only the next
  * run of that same program writes over. */
 static FILE *game_log_file;
+static FILE *event_log_file;
+static char event_log_path[640], event_log_header[1024];
+static size_t event_log_bytes;
+#define EVENT_LOG_LIMIT (1024u * 1024)
+_Static_assert( EVENT_LOG_LIMIT > sizeof(event_log_header) + 1024, "Event log must hold its header and a line" );
 
 struct runtime_module
 {
@@ -165,8 +172,49 @@ static int log_flusher_running;
 static int log_line_is_urgent( const char *line )
 {
     return !strncmp( line, "[EXC]", 5 ) || !strncmp( line, "[EXIT]", 6 ) ||
+           !strncmp( line, "[BOX64FAULT]", 12 ) || !strncmp( line, "[BOX64EXIT]", 11 ) ||
            !strncmp( line, "[FAIL]", 6 ) || !strncmp( line, "[PE32 TEST]", 11 ) ||
            !strncmp( line, "[LIFECYCLE] final", 17 ) || !strncmp( line, "[LIFECYCLE] verdict", 19 );
+}
+
+static int log_line_is_event( const char *line )
+{
+    static const char * const tags[] = { "[BUILD]", "[SESSION]", "[INIT]", "[SETTINGS]", "[MISS]",
+        "[STALL]", "[PROGRESS]", "[BOX64]", "[DYNAREC]", "[HZHOOK]", "[HZKBD]", "[HZNULL]",
+        "[HZUNIMPL]", "[NXHOOK]", "[NXWIN]", "[LOG]", "[STDIO]", "[HMAP]", "[IMAGE]", "[NXLDR]",
+        "[NXGL]", "[NXCOMP]" };
+    unsigned int i;
+
+    if (log_line_is_urgent( line ) || strstr( line, "[RUBY]" ) || strstr( line, ":err:" )) return 1;
+    for (i = 0; i < sizeof(tags) / sizeof(tags[0]); i++)
+        if (!strncmp( line, tags[i], strlen(tags[i]) )) return 1;
+    return 0;
+}
+
+/* Called with log_mutex held. Keep the newest two event segments independently of verbose output. */
+static void event_log_write( const char *line, size_t bytes )
+{
+    char prefix[64], previous[672];
+    int count;
+
+    if (!event_log_file) return;
+    count = snprintf( prefix, sizeof(prefix), "[EVENT ms=%llu] ",
+                      (unsigned long long)(armTicksToNs( armGetSystemTick() ) / 1000000) );
+    if (event_log_bytes + count + bytes > EVENT_LOG_LIMIT)
+    {
+        fclose( event_log_file );
+        event_log_file = NULL;
+        snprintf( previous, sizeof(previous), "%s.previous.log", event_log_path );
+        if (unlink( previous ) && errno != ENOENT) return;
+        if (rename( event_log_path, previous )) return;
+        if (!(event_log_file = fopen( event_log_path, "w" ))) return;
+        event_log_bytes = fwrite( event_log_header, 1, strlen(event_log_header), event_log_file );
+    }
+    event_log_bytes += fwrite( prefix, 1, count, event_log_file );
+    event_log_bytes += fwrite( line, 1, bytes, event_log_file );
+    if (!log_flusher_running || log_line_is_urgent( line ) || !strncmp( line, "[NXHOOK]", 8 ) ||
+        strstr( line, "FAIL path=" ) ||
+        strstr( line, ":err:" )) fflush( event_log_file );
 }
 
 static void runtime_tick_std_streams(void);
@@ -239,6 +287,8 @@ static void *log_flusher( void *arg )
         runtime_alternate_clean();
         pthread_mutex_lock( &log_mutex );
         fflush( log_file );
+        if (game_log_file) fflush( game_log_file );
+        if (event_log_file) fflush( event_log_file );
         pthread_mutex_unlock( &log_mutex );
     }
     return NULL;
@@ -337,6 +387,7 @@ static void log_line( const char *fmt, ... )
             bounded_log_write( log_file, message, bytes, &runtime_log_bytes );
         }
         bounded_log_write( log_file, line, len, &runtime_log_bytes );
+        if (log_line_is_event( line )) event_log_write( line, len );
         if (!log_flusher_running || log_line_is_urgent( line )) fflush( log_file );
         if (game_log_file)
         {
@@ -404,8 +455,16 @@ static void open_game_log( const char *target )
         }
         fflush( game_log_file );
     }
+    if (event_log_file) fclose( event_log_file );
+    snprintf( event_log_path, sizeof(event_log_path), "%s.events.log", path );
+    snprintf( event_log_header, sizeof(event_log_header),
+              "[BUILD] %s\n[SESSION] target=%s id=%08x started=%s verbose=%d profiler=%d\n",
+              WINE_NX_RUNTIME_BUILD, target, identity, stamp, wine_nx_runtime_verbose, runtime_profile );
+    event_log_file = fopen( event_log_path, "w" );
+    event_log_bytes = event_log_file ? fwrite( event_log_header, 1, strlen(event_log_header), event_log_file ) : 0;
     pthread_mutex_unlock( &log_mutex );
     log_line( "[LOG] this run is kept in %s", path );
+    log_line( "%s events=%s", event_log_file ? "[LOG]" : "[FAIL] cannot open", event_log_path );
     log_line( "[SESSION] target=%s id=%08x started=%s verbose=%d profiler=%d log_limit=64MiB",
               target, identity, stamp, wine_nx_runtime_verbose, runtime_profile );
 }
@@ -432,9 +491,9 @@ static void stall_watch( void *arg )
         if (frames != last_frames) { quiet = 0; reported = 0; }
         else quiet++;
         last_frames = frames;
-        /* Ten seconds without a frame. A game loading a level does that too, so
-         * this says its piece three times and then leaves the log alone. */
-        if (quiet >= 2 && reported < 3)
+        /* Initial snapshots plus one every thirty seconds catch stalls that
+         * begin after slow DLL initialization, independently of the flusher. */
+        if (quiet >= 2 && (reported < 3 || !(quiet % 6)))
         {
             log_line( "[STALL] no frame drawn for %u s; where the threads are standing", quiet * 5 );
             wine_nx_threads_report_stalled();
@@ -444,9 +503,57 @@ static void stall_watch( void *arg )
 }
 
 
+#ifdef WINE_NX_BOX64_CHECK_CODE
+extern void wine_nx_box64_code_settled( uintptr_t base, const char *name );
+
+/* Whether the PE loader's name, up to its status field, contains a word. */
+static int loader_name_has( const char *name, const char *end, const char *word )
+{
+    size_t len = strlen( word );
+    const char *p;
+
+    for (p = name; p + len <= end; p++)
+        if (!strncasecmp( p, word, len )) return 1;
+    return 0;
+}
+
+/* The PE loader's lines "[NXLDR] return name=... status=00000000 module=XXXXXXXX".
+ * A loaded RGSS DLL is remembered; the dynarec's checked phase ends once Ruby
+ * runs, which the first Win32API DLL of LonaRPG's scripts shows:
+ * Data/Scripts/10_removeF1F12.rb loads System/F1AltEnterF12.dll. Ending it as
+ * the RGSS DLL itself returned was too early (lonarpg/logs/20261025-014621-ru13-freeze). */
+static void check_code_milestone( const char *msg )
+{
+    static const char prefix[] = "[NXLDR] return name=";
+    static uintptr_t rgss_base;
+    static char rgss_name[96];
+    const char *name = msg + sizeof(prefix) - 1, *status, *module;
+    size_t len;
+
+    if (strncmp( msg, prefix, sizeof(prefix) - 1 ) || !(status = strstr( name, " status=00000000 module=" )))
+        return;
+    module = status + sizeof(" status=00000000 module=") - 1;
+    if (!rgss_base && loader_name_has( name, status, "rgss" ))
+    {
+        rgss_base = (uintptr_t)strtoull( module, NULL, 16 );
+        len = (size_t)(status - name) < sizeof(rgss_name) - 1 ? (size_t)(status - name) : sizeof(rgss_name) - 1;
+        memcpy( rgss_name, name, len );
+        rgss_name[len] = 0;
+        log_line( "[DYNAREC] %s loaded at %#lx; checked phase lasts until F1AltEnterF12.dll loads",
+                  rgss_name, (unsigned long)rgss_base );
+        return;
+    }
+    if (rgss_base && loader_name_has( name, status, "f1altenterf12" ))
+        wine_nx_box64_code_settled( rgss_base, rgss_name );
+}
+#endif
+
 void wine_nx_runtime_trace( const char *msg )
 {
     log_line( "%s", msg );
+#ifdef WINE_NX_BOX64_CHECK_CODE
+    check_code_milestone( msg );
+#endif
 }
 
 /* Per-operation traces (system calls, server requests, fonts, window painting)
@@ -618,6 +725,43 @@ int wine_nx_compositor_enabled(void)
         wine_nx_compositor_cursor( x, y, visible );
     }
     return 1;
+}
+
+static pthread_mutex_t wine_nx_gl_api_mutex = PTHREAD_MUTEX_INITIALIZER;
+static __thread unsigned int wine_nx_gl_api_depth;
+
+/* Mesa 20.1's nouveau cannot draw concurrently from API and presenter threads.
+ * Offscreen contexts borrow GPU time, not ownership of the screen. */
+void wine_nx_gl_call_begin(void)
+{
+    if (wine_nx_gl_api_depth++) return;
+    pthread_mutex_lock( &wine_nx_gl_api_mutex );
+    wine_nx_compositor_enabled();
+    wine_nx_compositor_gl_pause();
+}
+
+void wine_nx_gl_call_end(void)
+{
+    if (!wine_nx_gl_api_depth || --wine_nx_gl_api_depth) return;
+    wine_nx_compositor_gl_unpause();
+    pthread_mutex_unlock( &wine_nx_gl_api_mutex );
+}
+
+unsigned int wine_nx_gl_call_depth(void)
+{
+    return wine_nx_gl_api_depth;
+}
+
+/* A guest fault can longjmp across the unix call; retain an enclosing callback's guard. */
+void wine_nx_gl_call_unwind( unsigned int depth )
+{
+    if (wine_nx_gl_api_depth <= depth) return;
+    if (depth) wine_nx_gl_api_depth = depth;
+    else
+    {
+        wine_nx_gl_api_depth = 1;
+        wine_nx_gl_call_end();
+    }
 }
 
 /* An OpenGL window surface takes the screen. libnx's framebuffer and EGL cannot
@@ -1217,7 +1361,8 @@ static void std_stream_log( void *ctx, const char *line )
 {
     struct std_stream *stream = ctx;
 
-    if (stream->lines.lines < STD_STREAM_LOG_LINES) log_line( "[%s] %s", stream->tag, line );
+    if (stream->lines.lines < STD_STREAM_LOG_LINES || strstr( line, "[RUBY]" ) || strstr( line, ":err:" ))
+        log_line( "[%s] %s", stream->tag, line );
     else if (stream->lines.lines == STD_STREAM_LOG_LINES)
         log_line( "[%s] (further output only in %s)", stream->tag, stream->path );
 }
@@ -1281,23 +1426,24 @@ static void runtime_report_interpreter(void)
     u64 now = armGetSystemTick();
     double seconds;
 
-    if (!wine_nx_runtime_verbose)
     {
         /* Without verbose traces a white screen says nothing about whether a
-         * program is still loading, computing or drawing. Every 10 seconds, if
-         * anything changed: completed file reads and the time inside NtReadFile,
+         * program is still loading, computing or drawing. Every 10 seconds:
+         * completed file reads and the time inside NtReadFile,
          * the bytes they returned, read requests to the SD card, their time,
          * the bytes they brought back, the reads the cache served and what it
          * is holding, system calls, frames shown and dynarec entries. */
         extern unsigned int wine_nx_file_reads __attribute__((weak));
         extern unsigned long long wine_nx_file_read_100ns __attribute__((weak));
         extern unsigned int wine_nx_syscalls __attribute__((weak));
+        extern unsigned int wine_nx_handled_page_faults __attribute__((weak));
         extern unsigned int wine_nx_audio_underruns __attribute__((weak));
         extern unsigned int wine_nx_sd_reads, wine_nx_sd_hits;
         extern unsigned long long wine_nx_sd_read_ns, wine_nx_sd_bytes;
         extern unsigned long long wine_nx_file_read_bytes __attribute__((weak));
         extern unsigned int wine_nx_sd_cache_mb( void );
         extern unsigned int wine_nx_gl_swaps __attribute__((weak)), wine_nx_gl_calls __attribute__((weak));
+        extern unsigned int wine_nx_gl_swap_attempts __attribute__((weak)), wine_nx_gl_swap_failures __attribute__((weak));
         extern unsigned int wine_nx_vk_presents __attribute__((weak));
         extern unsigned int wine_nx_gl_persistent_failures __attribute__((weak));
         extern unsigned long long wine_nx_gl_swap_time __attribute__((weak)), wine_nx_gl_call_time __attribute__((weak));
@@ -1317,7 +1463,7 @@ static void runtime_report_interpreter(void)
         extern unsigned int wine_nx_gl_explicit_flushes __attribute__((weak));
         extern int wine_nx_gl_pinned_memory __attribute__((weak));
         extern unsigned int wine_nx_syscall_counts[] __attribute__((weak));
-        static unsigned int calls, last_reads = ~0u, last_frames = ~0u;
+        static unsigned int calls;
         static u64 start;
         unsigned int reads = &wine_nx_file_reads ? __atomic_load_n( &wine_nx_file_reads, __ATOMIC_RELAXED ) : 0;
         unsigned int gl_frames = &wine_nx_gl_swaps ? __atomic_load_n( &wine_nx_gl_swaps, __ATOMIC_RELAXED ) : 0;
@@ -1331,9 +1477,6 @@ static void runtime_report_interpreter(void)
 
         if (!start) start = now;
         if (++calls % 2) return;
-        if (reads == last_reads && frames == last_frames) return;
-        last_reads = reads;
-        last_frames = frames;
         /* The three system calls made most since the last line, as id:calls: a
          * program's busy loop shows here without verbose traces. */
         if (wine_nx_syscall_counts)
@@ -1409,8 +1552,11 @@ static void runtime_report_interpreter(void)
          * and the slowest opengl32 functions of the last 10 seconds. */
         if (gl_frames || (&wine_nx_gl_calls && wine_nx_gl_calls))
         {
-            int len = snprintf( gl, sizeof(gl), " gl_frames=%u swap_ms=%llu gl_calls=%u gl_ms=%llu copy_mb=%llu persistent_fail=%u pinned=%d",
-                                gl_frames, __atomic_load_n( &wine_nx_gl_swap_time, __ATOMIC_RELAXED ) / 10000,
+            int len = snprintf( gl, sizeof(gl), " gl_frames=%u swap_attempts=%u swap_failures=%u swap_ms=%llu gl_calls=%u gl_ms=%llu copy_mb=%llu persistent_fail=%u pinned=%d",
+                                gl_frames,
+                                &wine_nx_gl_swap_attempts ? __atomic_load_n( &wine_nx_gl_swap_attempts, __ATOMIC_RELAXED ) : 0,
+                                &wine_nx_gl_swap_failures ? __atomic_load_n( &wine_nx_gl_swap_failures, __ATOMIC_RELAXED ) : 0,
+                                __atomic_load_n( &wine_nx_gl_swap_time, __ATOMIC_RELAXED ) / 10000,
                                 __atomic_load_n( &wine_nx_gl_calls, __ATOMIC_RELAXED ),
                                 __atomic_load_n( &wine_nx_gl_call_time, __ATOMIC_RELAXED ) / 10000,
                                 (&wine_nx_gl_copy_bytes ? __atomic_load_n( &wine_nx_gl_copy_bytes, __ATOMIC_RELAXED ) : 0) >> 20,
@@ -1462,7 +1608,7 @@ static void runtime_report_interpreter(void)
          * the cache holds, which follows the heap the game leaves free. */
         log_line( "[PROGRESS] %llus reads=%u read_ms=%llu read_mb=%llu sd_reads=%u sd_ms=%llu sd_mb=%llu "
                   "cache_hits=%u cache_mb=%u syscalls=%u "
-                  "frames=%u heap_used_mb=%llu heap_free_mb=%llu%s%s%s%s",
+                  "frames=%u faults_handled=%u heap_used_mb=%llu heap_free_mb=%llu%s%s%s%s",
                   (unsigned long long)(armTicksToNs( now - start ) / 1000000000ull), reads, read_ms,
                   &wine_nx_file_read_bytes
                       ? __atomic_load_n( &wine_nx_file_read_bytes, __ATOMIC_RELAXED ) >> 20 : 0,
@@ -1470,6 +1616,8 @@ static void runtime_report_interpreter(void)
                   __atomic_load_n( &wine_nx_sd_read_ns, __ATOMIC_RELAXED ) / 1000000,
                   __atomic_load_n( &wine_nx_sd_bytes, __ATOMIC_RELAXED ) >> 20,
                   __atomic_load_n( &wine_nx_sd_hits, __ATOMIC_RELAXED ), wine_nx_sd_cache_mb(), syscalls, frames,
+                  &wine_nx_handled_page_faults
+                      ? __atomic_load_n( &wine_nx_handled_page_faults, __ATOMIC_RELAXED ) : 0,
                   (unsigned long long)heap.uordblks >> 20, heap_free >> 20, systop, native, gl, audio );
         {
             extern void wine_nx_thread_report( void );
@@ -1479,7 +1627,6 @@ static void runtime_report_interpreter(void)
             log_line( "%s", pool_stats );
             wine_nx_thread_report();
         }
-        return;
     }
 
 #ifdef WINE_NX_BOX64_DYNAREC
@@ -3705,6 +3852,10 @@ int main( int argc, char **argv )
     if (log_file)
     {
         setvbuf( log_file, log_file_buffer, _IOFBF, sizeof(log_file_buffer) );
+        strcpy( event_log_path, RUNTIME_LOGS "/autorun_events.log" );
+        snprintf( event_log_header, sizeof(event_log_header), "[BUILD] %s\n", WINE_NX_RUNTIME_BUILD );
+        event_log_file = fopen( event_log_path, "w" );
+        event_log_bytes = event_log_file ? fwrite( event_log_header, 1, strlen(event_log_header), event_log_file ) : 0;
         log_flusher_running = !pthread_create( &log_flusher_thread, NULL, log_flusher, NULL );
         /* Above the program's threads (59) and below the audio feeder (56), so
          * it is read even when they are all busy waiting. */

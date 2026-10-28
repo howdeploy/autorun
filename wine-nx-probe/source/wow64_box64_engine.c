@@ -62,7 +62,11 @@ struct nx_engine
     struct nx_engine *previous;     /* active_engine outside the run */
     unsigned int native_fpcr;       /* the host's FPCR, restored for unix calls */
     int context_replaced;           /* a unix call in EmuRun replaced the context */
+    unsigned int gl_api_depth;      /* host GL guard at this run's entry */
 };
+
+extern unsigned int wine_nx_gl_call_depth(void) __attribute__((weak));
+extern void wine_nx_gl_call_unwind( unsigned int depth ) __attribute__((weak));
 
 static __thread struct nx_engine *active_engine;
 /* A run's engine. Allocating and freeing one per run cost Direct3D's command
@@ -178,6 +182,7 @@ static void stop_engine( x64emu_t *emu, NTSTATUS status )
 {
     struct nx_engine *engine = (struct nx_engine *)emu;
     engine->status = status;
+    if (wine_nx_gl_call_unwind) wine_nx_gl_call_unwind( engine->gl_api_depth );
 #ifdef __SWITCH__
     longjmp( engine->escape, 1 );
 #else
@@ -812,6 +817,7 @@ NTSTATUS wine_nx_box64_run( I386_CONTEXT *context, ULONG fs_base,
     __atomic_add_fetch( &wine_nx_box64_live_engines, 1, __ATOMIC_RELAXED );
     engine->gates = gates; engine->host = host; engine->opaque = opaque;
     engine->context = context; engine->previous = previous;
+    engine->gl_api_depth = wine_nx_gl_call_depth ? wine_nx_gl_call_depth() : 0;
     engine->is32bits = 1; engine->address_limit = UINT64_C(0x100000000);
     engine->fs_base = fs_base; engine->completion = completion_pc; engine->remaining = budget;
     engine->code_page = 1;
@@ -922,6 +928,7 @@ NTSTATUS wine_nx_box64_run_amd64( AMD64_CONTEXT *context, ULONG_PTR gs_base,
     __atomic_add_fetch( &wine_nx_box64_live_engines, 1, __ATOMIC_RELAXED );
     engine->amd64_host = host; engine->opaque = opaque; engine->amd64_context = context;
     engine->previous = previous; engine->gs_base = gs_base; engine->completion = completion;
+    engine->gl_api_depth = wine_nx_gl_call_depth ? wine_nx_gl_call_depth() : 0;
     engine->address_limit = host->address_limit; engine->remaining = budget; engine->code_page = 1;
     engine->emu.context = &core_context;
     engine->emu.x64emu_parity_tab = parity;

@@ -21,6 +21,8 @@
 #define FILE_LIMIT (16u * 1024 * 1024)
 #define REPORT_LIMIT (64u * 1024 * 1024)
 _Static_assert( REPORT_LIMIT >= FILE_LIMIT, "A report must hold one log" );
+static const char omitted_marker[] = "\n[REPORT] Middle of this log omitted; resuming the original tail.\n";
+_Static_assert( FILE_LIMIT > 4 * sizeof(omitted_marker), "Head and tail must fit the report limit" );
 
 struct report_file { char name[256]; size_t size; time_t modified; };
 
@@ -52,12 +54,27 @@ static int zip_text( zipFile zip, const char *name, const void *data, size_t siz
     return zipCloseFileInZip( zip ) == ZIP_OK && ok;
 }
 
+static int zip_file_range( zipFile zip, FILE *file, size_t offset, size_t bytes )
+{
+    unsigned char buffer[16384];
+
+    if (fseeko( file, offset, SEEK_SET )) return 0;
+    while (bytes)
+    {
+        size_t take = bytes < sizeof(buffer) ? bytes : sizeof(buffer);
+        size_t got = fread( buffer, 1, take, file );
+        if (!got || zipWriteInFileInZip( zip, buffer, got ) != ZIP_OK) return 0;
+        bytes -= got;
+    }
+    return 1;
+}
+
 int diagnostics_report( const struct wine_nx_launcher_options *options, char *path, size_t size )
 {
     const char *runtime = options->runtime_dir;
     struct report_file files[REPORT_FILES];
     char folder[512], source[768], temporary[768], report[24576], stamp[32];
-    unsigned char suffix[8], buffer[16384];
+    unsigned char suffix[8];
     struct dirent *entry;
     struct stat st;
     time_t now = time( NULL );
@@ -108,10 +125,11 @@ int diagnostics_report( const struct wine_nx_launcher_options *options, char *pa
     qsort( files, count, sizeof(files[0]), newest_first );
     if (!(zip = zipOpen64( temporary, APPEND_STATUS_CREATE ))) return 0;
     used = snprintf( report, sizeof(report),
-                     "Autorun RU Diagnostics\nBuild: %s\nCreated: %s\n"
+                     "Autorun RU Diagnostics\nReport exporter build: %s\nCreated: %s\n"
                      "UI language: %s\nGlobal verbose: %d\nGlobal profiler: %d\nAddress space: %d bits\nEmuMMC: %d\n"
                      "Limits: 16 MiB per log; 64 MiB per report; 64 logs.\n"
-                     "Oversized logs contain their tail. stdin, raw settings, saves and game files are excluded.\n"
+                     "Oversized logs contain head + omission marker + tail. Session BUILD lines identify each run.\n"
+                     "stdin, raw settings, saves and game files are excluded.\n"
                      "Logs are not redacted: they may contain paths, arguments and application diagnostic output.\n\n",
                      options->build ? options->build : "unknown", stamp, launcher_language_code(),
                      options->verbose, options->profile, options->address_space_bits, options->emummc );
@@ -119,28 +137,25 @@ int diagnostics_report( const struct wine_nx_launcher_options *options, char *pa
     {
         FILE *file;
         size_t bytes = files[i].size < FILE_LIMIT ? files[i].size : FILE_LIMIT;
-        size_t left = bytes;
+        size_t head = files[i].size > bytes ? bytes / 4 : bytes;
+        size_t tail = files[i].size > bytes ? bytes - head - (sizeof(omitted_marker) - 1) : 0;
         if (bytes > REPORT_LIMIT - total) { skipped++; continue; }
         if (snprintf( source, sizeof(source), "%s/%s", folder, files[i].name ) >= (int)sizeof(source)) { ok = 0; break; }
         if (!(file = fopen( source, "rb" ))) { skipped++; continue; }
-        if (files[i].size > bytes && fseeko( file, files[i].size - bytes, SEEK_SET ))
-        { fclose( file ); skipped++; continue; }
         if (zipOpenNewFileInZip64( zip, files[i].name, NULL, NULL, 0, NULL, 0, NULL,
                                   Z_DEFLATED, Z_BEST_SPEED, 0 ) != ZIP_OK)
         { fclose( file ); ok = 0; break; }
-        while (left)
-        {
-            size_t take = left < sizeof(buffer) ? left : sizeof(buffer);
-            size_t got = fread( buffer, 1, take, file );
-            if (!got || zipWriteInFileInZip( zip, buffer, got ) != ZIP_OK) { ok = 0; break; }
-            left -= got;
-        }
+        ok = zip_file_range( zip, file, 0, head );
+        if (ok && tail)
+            ok = zipWriteInFileInZip( zip, omitted_marker, sizeof(omitted_marker) - 1 ) == ZIP_OK &&
+                 zip_file_range( zip, file, files[i].size - tail, tail );
         fclose( file );
         if (zipCloseFileInZip( zip ) != ZIP_OK) ok = 0;
         total += bytes;
         if (used < sizeof(report))
-            used += snprintf( report + used, sizeof(report) - used, "%s: %zu bytes%s\n",
-                              files[i].name, bytes, files[i].size > bytes ? " (tail, truncated)" : "" );
+            used += snprintf( report + used, sizeof(report) - used,
+                              "%s: original=%zu exported=%zu head=%zu tail=%zu omitted=%zu\n",
+                              files[i].name, files[i].size, bytes, head, tail, files[i].size - head - tail );
     }
     if (used < sizeof(report))
         used += snprintf( report + used, sizeof(report) - used, "\nSkipped logs: %d\n", skipped );

@@ -70,6 +70,12 @@ void wine_nx_compositor_stop( void );
 void wine_nx_compositor_suspend( void );
 void wine_nx_compositor_resume( void );
 
+/* Serialize offscreen GL work with the presenter without releasing NWindow.
+ * Callers serialize their own API threads and pair pause/unpause. A screen
+ * handoff may still request suspend while paused. */
+void wine_nx_compositor_gl_pause( void );
+void wine_nx_compositor_gl_unpause( void );
+
 /* Frames presented so far, for [PROGRESS]. */
 unsigned int wine_nx_compositor_frames( void );
 

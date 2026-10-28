@@ -31,6 +31,24 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(hook);
 
+#ifdef __SWITCH__
+#include <stdio.h>
+extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+
+static void nx_hook_trace( const struct win_hook_params *params, const char *phase,
+                           NTSTATUS status, ULONG bytes, LRESULT result )
+{
+    char message[256];
+
+    if (!wine_nx_runtime_trace) return;
+    snprintf( message, sizeof(message),
+              "[NXHOOK] %s tid=%04x id=%d handle=%p depth=%u status=%08lx bytes=%lu result=%lld",
+              phase, GetCurrentThreadId(), params->id, params->handle, get_user_thread_info()->hook_call_depth,
+              (unsigned long)status, (unsigned long)bytes, (long long)result );
+    wine_nx_runtime_trace( message );
+}
+#endif
+
 static const char * const hook_names[NB_HOOKS] =
 {
     "WH_MSGFILTER",
@@ -247,7 +265,14 @@ static LRESULT call_hook( struct win_hook_params *info, const WCHAR *module, siz
         void *ret_ptr, *extra_buffer = NULL;
         SIZE_T extra_buffer_size = 0;
         size_t reply_size;
-        ULONG ret_len;
+        ULONG ret_len = 0;
+        NTSTATUS callback_status;
+#ifdef __SWITCH__
+        static unsigned int callback_counts[NB_HOOKS];
+        unsigned int index = info->id - WH_MINHOOK;
+        BOOL trace_callback = index < NB_HOOKS &&
+            __atomic_add_fetch( &callback_counts[index], 1, __ATOMIC_RELAXED ) <= 16;
+#endif
 
         size = FIELD_OFFSET( struct win_hook_params, module[module ? lstrlenW( module ) + 1 : 1] );
 
@@ -336,14 +361,21 @@ static LRESULT call_hook( struct win_hook_params *info, const WCHAR *module, siz
         thread_info->hook = params->handle;
         thread_info->hook_unicode = params->next_unicode;
         thread_info->hook_call_depth++;
-        if (!KeUserModeCallback( NtUserCallWindowsHook, params, size, &ret_ptr, &ret_len ) &&
-            ret_len >= sizeof(ret))
+#ifdef __SWITCH__
+        if (trace_callback) nx_hook_trace( params, "enter", 0, 0, 0 );
+#endif
+        callback_status = KeUserModeCallback( NtUserCallWindowsHook, params, size, &ret_ptr, &ret_len );
+        if (!callback_status && ret_len >= sizeof(ret))
         {
             LRESULT *result_ptr = ret_ptr;
             ret = *result_ptr;
             if (ret_len == sizeof(ret) + lparam_ret_size)
                 memcpy( (void *)params->lparam, result_ptr + 1, ret_len - sizeof(ret) );
         }
+#ifdef __SWITCH__
+        if (trace_callback || callback_status || ret_len < sizeof(ret))
+            nx_hook_trace( params, "return", callback_status, ret_len, ret );
+#endif
         thread_info->hook = prev;
         thread_info->hook_unicode = prev_unicode;
         thread_info->hook_call_depth--;
