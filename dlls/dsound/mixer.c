@@ -376,6 +376,9 @@ static inline void get_samples(const IDirectSoundBufferImpl *dsb, BYTE *buffer, 
     DWORD advance;
     DWORD pos;
 
+    if (!count)
+        return;
+
     if (dsb->state == STATE_STOPPING) {
         memset(dst, 0, count * ostride);
         return;
@@ -404,6 +407,9 @@ static inline void filter_samples(const IDirectSoundBufferImpl *dsb, BYTE *buffe
     UINT istride = dsb->pwfx->nBlockAlign;
     IMediaObjectInPlace *inplace;
     int i;
+
+    if (!count)
+        return;
 
     get_samples(dsb, buffer, buflen, mixpos, 0, count, istride, dst, get_raw);
 
@@ -590,7 +596,7 @@ static UINT cp_fields_resample(IDirectSoundBufferImpl *dsb, UINT count, DWORD *f
     UINT required_input = max(
             (freqAcc_start + (count - 1) * dsb->freqAdjustNum) / dsb->freqAdjustDen + FIR_WIDTH,
             (freqAcc_start + (count - 1 + FIR_WIDTH) * dsb->freqAdjustNum) / dsb->freqAdjustDen);
-    float *intermediate, *output;
+    float *intermediate, *output, *cp_buffer;
 
     DWORD len = total_input * channels;
     /* Allocate an output buffer for each channel with padding on both ends as
@@ -605,7 +611,7 @@ static UINT cp_fields_resample(IDirectSoundBufferImpl *dsb, UINT count, DWORD *f
         if (dsb->device->filter_buffer_len < size_bytes) {
             BYTE *filter_buffer = realloc(dsb->device->filter_buffer, size_bytes);
             if (!filter_buffer)
-                return max_ipos;
+                goto failed;
             dsb->device->filter_buffer_len = size_bytes;
             dsb->device->filter_buffer = filter_buffer;
         }
@@ -621,11 +627,10 @@ static UINT cp_fields_resample(IDirectSoundBufferImpl *dsb, UINT count, DWORD *f
         return max_ipos;
     }
 
-    if (!dsb->device->cp_buffer) {
-        dsb->device->cp_buffer = malloc(len);
-        dsb->device->cp_buffer_len = len;
-    } else if (len > dsb->device->cp_buffer_len) {
-        dsb->device->cp_buffer = realloc(dsb->device->cp_buffer, len);
+    if (!dsb->device->cp_buffer || len > dsb->device->cp_buffer_len) {
+        if (!(cp_buffer = realloc(dsb->device->cp_buffer, len)))
+            goto failed;
+        dsb->device->cp_buffer = cp_buffer;
         dsb->device->cp_buffer_len = len;
     }
 
@@ -672,13 +677,19 @@ static UINT cp_fields_resample(IDirectSoundBufferImpl *dsb, UINT count, DWORD *f
     dsb->input_tail_valid = TRUE;
 
     return max_ipos;
+
+failed:
+    *freqAccNum = freqAcc_end % dsb->freqAdjustDen;
+    dsb->input_tail_valid = FALSE;
+    memset(dsb->device->tmp_buffer, 0, count * ostride);
+    return max_ipos;
 }
 
 static UINT cp_fields_noresample(IDirectSoundBufferImpl *dsb, UINT count)
 {
     UINT ostride = dsb->device->pwfx->nChannels * sizeof(float);
     DWORD total_input = dsb->input_delay + count;
-    float *intermediate;
+    float *intermediate, *cp_buffer;
     DWORD channel, i;
 
     DWORD len = total_input * dsb->mix_channels;
@@ -690,7 +701,7 @@ static UINT cp_fields_noresample(IDirectSoundBufferImpl *dsb, UINT count)
         if (dsb->device->filter_buffer_len < size_bytes) {
             BYTE *filter_buffer = realloc(dsb->device->filter_buffer, size_bytes);
             if (!filter_buffer)
-                return count;
+                goto failed;
             dsb->device->filter_buffer_len = size_bytes;
             dsb->device->filter_buffer = filter_buffer;
         }
@@ -704,11 +715,10 @@ static UINT cp_fields_noresample(IDirectSoundBufferImpl *dsb, UINT count)
         return count;
     }
 
-    if (!dsb->device->cp_buffer) {
-        dsb->device->cp_buffer = malloc(len);
-        dsb->device->cp_buffer_len = len;
-    } else if (len > dsb->device->cp_buffer_len) {
-        dsb->device->cp_buffer = realloc(dsb->device->cp_buffer, len);
+    if (!dsb->device->cp_buffer || len > dsb->device->cp_buffer_len) {
+        if (!(cp_buffer = realloc(dsb->device->cp_buffer, len)))
+            goto failed;
+        dsb->device->cp_buffer = cp_buffer;
         dsb->device->cp_buffer_len = len;
     }
 
@@ -744,6 +754,11 @@ static UINT cp_fields_noresample(IDirectSoundBufferImpl *dsb, UINT count)
 
     dsb->input_tail_valid = TRUE;
 
+    return count;
+
+failed:
+    dsb->input_tail_valid = FALSE;
+    memset(dsb->device->tmp_buffer, 0, count * ostride);
     return count;
 }
 
@@ -804,19 +819,23 @@ static inline DWORD DSOUND_BufPtrDiff(DWORD buflen, DWORD ptr1, DWORD ptr2)
  *
  * NOTE: writepos + len <= buflen. When called by mixer, MixOne makes sure of this.
  */
-static void DSOUND_MixToTemporary(IDirectSoundBufferImpl *dsb, DWORD frames)
+static BOOL DSOUND_MixToTemporary(IDirectSoundBufferImpl *dsb, DWORD frames)
 {
 	UINT size_bytes = frames * sizeof(float) * dsb->device->pwfx->nChannels;
+	float *buffer;
 
 	if (dsb->device->tmp_buffer_len < size_bytes || !dsb->device->tmp_buffer)
 	{
+		if (!(buffer = realloc(dsb->device->tmp_buffer, size_bytes)))
+			return FALSE;
+		dsb->device->tmp_buffer = buffer;
 		dsb->device->tmp_buffer_len = size_bytes;
-		dsb->device->tmp_buffer = realloc(dsb->device->tmp_buffer, size_bytes);
 	}
 	if(dsb->put_aux == putieee32_sum)
 		memset(dsb->device->tmp_buffer, 0, dsb->device->tmp_buffer_len);
 
 	cp_fields(dsb, frames, &dsb->freqAccNum);
+	return TRUE;
 }
 
 static void DSOUND_MixerVol(const IDirectSoundBufferImpl *dsb, INT frames)
@@ -872,7 +891,8 @@ static DWORD DSOUND_MixInBuffer(IDirectSoundBufferImpl *dsb, float *mix_buffer, 
 
 	/* Resample buffer to temporary buffer specifically allocated for this purpose, if needed */
 	oldpos = dsb->sec_playpos;
-	DSOUND_MixToTemporary(dsb, frames);
+	if (!DSOUND_MixToTemporary(dsb, frames))
+		return 0;
 	ibuf = dsb->device->tmp_buffer;
 
 	if (secondarybuffer_is_audible(dsb)) {

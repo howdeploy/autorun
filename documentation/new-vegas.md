@@ -115,6 +115,39 @@ enabled in the captured session, which
 reached the 64 MiB log limit; use a separate trace-disabled comparison before
 drawing performance conclusions.
 
+## Post-patch session and audio source review, 2026-10-28
+
+The user's 14:29 session loads the system quartz.dll successfully, with verbose
+traces off. An FTP readback matches the custom MP3 payload's SHA-256; the earlier
+MPEG splitter creation error is absent. This does not establish audible music
+or an interactive main menu. Later the display counter stays at 10563 and file
+reads stop; the stall watcher records 120 seconds without a new frame. During
+the final four CPU intervals, `wine_dsound_mixer` uses 99.3% of a core while the
+main thread waits. About 1804 MiB of heap remains free. The native snapshots do
+not resolve the guest function in FEX's translated code, so the exact cause of
+that loop remains unconfirmed.
+
+The audio-path source review fixes these independent defects together:
+
+- DirectSound published and freed its notification array without taking the
+  buffer lock used by the mixer. It now sorts a replacement privately, swaps
+  pointer and count under the exclusive lock, and preserves the previous array
+  if allocation fails. Oversized counts cannot overflow its allocation size
+  or signed count field.
+- The native AVI/MP3 splitter now begins a downstream flush before waiting for
+  a delivery lock or joining a streaming thread. Decommitting its own allocator
+  alone cannot unblock a decoder's Receive. All streams are unblocked before
+  any thread is joined, and each flush ends after the corresponding thread exits.
+- Allocator-commit and streaming-thread creation failures now propagate to the
+  graph and clean up streams already started instead of reporting success.
+- DirectSound skips empty sample reads before circular-buffer arithmetic,
+  preserves scratch allocations when realloc fails, and uses silence instead
+  of dereferencing a failed allocation or mixing stale temporary data.
+
+These follow-up source changes have not been built, tested or installed on the
+console. They are not yet evidence that the reported FEX/audio stall is fixed.
+The upstream main head was checked through Git and remains `1ac9b6cf`.
+
 ## First comparison, when console testing is requested
 
 Start with FEX and DXVK, frame generation off, verbose traces off, the Low
@@ -147,4 +180,5 @@ The FEX/DXVK/VKD3D runtime was cross-compiled in the pinned switch-dev image
 on 2026-10-28 while preparing its installation. The Linux package verifier
 uses the same `WINE_NX_LLVM_MINGW` toolchain as the build. Existing upstream
 tests are retained; automated test suites, UI checks and console game launches
-have not been run. Successful launch and performance remain unverified.
+have not been run by the agent. Interactive gameplay and performance remain
+unverified.

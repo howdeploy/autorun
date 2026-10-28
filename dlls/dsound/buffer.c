@@ -19,6 +19,7 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#include <limits.h>
 #include <stdarg.h>
 
 #define COBJMACROS
@@ -105,11 +106,13 @@ static HRESULT WINAPI IDirectSoundNotifyImpl_SetNotificationPositions(IDirectSou
         DWORD howmuch, const DSBPOSITIONNOTIFY *notify)
 {
         IDirectSoundBufferImpl *This = impl_from_IDirectSoundNotify(iface);
+        DSBPOSITIONNOTIFY *notifies = NULL, *old_notifies;
 
 	TRACE("(%p,0x%08lx,%p)\n",This,howmuch,notify);
 
-        if (howmuch > 0 && notify == NULL) {
-	    WARN("invalid parameter: notify == NULL\n");
+        if (howmuch > INT_MAX || howmuch > ~(SIZE_T)0 / sizeof(*notifies)
+                || (howmuch > 0 && notify == NULL)) {
+	    WARN("invalid notification array: count %lu, notify %p\n", howmuch, notify);
 	    return DSERR_INVALIDPARAM;
 	}
 
@@ -121,23 +124,22 @@ static HRESULT WINAPI IDirectSoundNotifyImpl_SetNotificationPositions(IDirectSou
 	}
 
 	if (howmuch > 0) {
-	    /* Make an internal copy of the caller-supplied array.
-	     * Replace the existing copy if one is already present. */
-            free(This->notifies);
-            This->notifies = malloc(howmuch * sizeof(DSBPOSITIONNOTIFY));
-
-            if (This->notifies == NULL) {
+            notifies = malloc(howmuch * sizeof(*notifies));
+            if (!notifies) {
 		    WARN("out of memory\n");
 		    return DSERR_OUTOFMEMORY;
 	    }
-            CopyMemory(This->notifies, notify, howmuch * sizeof(DSBPOSITIONNOTIFY));
-            This->nrofnotifies = howmuch;
-            qsort(This->notifies, howmuch, sizeof(DSBPOSITIONNOTIFY), notify_compar);
-	} else {
-           free(This->notifies);
-           This->notifies = NULL;
-           This->nrofnotifies = 0;
+            CopyMemory(notifies, notify, howmuch * sizeof(*notifies));
+            qsort(notifies, howmuch, sizeof(*notifies), notify_compar);
 	}
+
+        /* The mixer reads the sorted array while holding this lock. */
+        AcquireSRWLockExclusive(&This->lock);
+        old_notifies = This->notifies;
+        This->notifies = notifies;
+        This->nrofnotifies = howmuch;
+        ReleaseSRWLockExclusive(&This->lock);
+        free(old_notifies);
 
 	return S_OK;
 }

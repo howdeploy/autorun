@@ -1077,9 +1077,12 @@ static void avi_destroy(struct strmbase_filter *iface)
     free(filter);
 }
 
+static HRESULT avi_cleanup_stream(struct strmbase_filter *iface);
+
 static HRESULT avi_init_stream(struct strmbase_filter *iface)
 {
     struct avi_splitter *filter = impl_from_strmbase_filter(iface);
+    HRESULT hr;
     size_t i;
 
     if (!filter->reader)
@@ -1088,19 +1091,30 @@ static HRESULT avi_init_stream(struct strmbase_filter *iface)
     for (i = 0; i < filter->stream_count; ++i)
     {
         struct avi_stream *stream = filter->streams[i];
-        HRESULT hr;
 
         if (!stream->pin.pin.peer)
             continue;
         if (FAILED(hr = IMemAllocator_Commit(stream->pin.pAllocator)))
-            ERR("Failed to commit allocator, hr %#lx.\n", hr);
+            goto fail;
         /* DirectShow keeps the seek position, and resets to it when it goes
          * from stopped to paused. */
         seek_stream(stream, stream->seek.llCurrent);
         stream->streaming = true;
         stream->thread = CreateThread(NULL, 0, stream_thread, stream, 0, NULL);
+        if (!stream->thread)
+        {
+            hr = HRESULT_FROM_WIN32(GetLastError());
+            stream->streaming = false;
+            IMemAllocator_Decommit(stream->pin.pAllocator);
+            goto fail;
+        }
     }
     return S_OK;
+
+fail:
+    ERR("Failed to initialize stream, hr %#lx.\n", hr);
+    avi_cleanup_stream(iface);
+    return hr;
 }
 
 static HRESULT avi_cleanup_stream(struct strmbase_filter *iface)
@@ -1111,21 +1125,38 @@ static HRESULT avi_cleanup_stream(struct strmbase_filter *iface)
     if (!filter->reader)
         return S_OK;
 
+    /* Unblock every downstream Receive before taking a delivery lock or
+     * joining a thread; decommitting only releases our own GetBuffer wait. */
     for (i = 0; i < filter->stream_count; ++i)
     {
         struct avi_stream *stream = filter->streams[i];
 
         if (!stream->thread)
             continue;
-        /* Decommitting releases a thread waiting for a sample. */
+        IPin_BeginFlush(stream->pin.pin.peer);
         IMemAllocator_Decommit(stream->pin.pAllocator);
+    }
+    for (i = 0; i < filter->stream_count; ++i)
+    {
+        struct avi_stream *stream = filter->streams[i];
+
+        if (!stream->thread)
+            continue;
         EnterCriticalSection(&stream->flushing_cs);
         stream->streaming = false;
         LeaveCriticalSection(&stream->flushing_cs);
         WakeConditionVariable(&stream->eos_cv);
+    }
+    for (i = 0; i < filter->stream_count; ++i)
+    {
+        struct avi_stream *stream = filter->streams[i];
+
+        if (!stream->thread)
+            continue;
         WaitForSingleObject(stream->thread, INFINITE);
         CloseHandle(stream->thread);
         stream->thread = NULL;
+        IPin_EndFlush(stream->pin.pin.peer);
     }
     return S_OK;
 }
