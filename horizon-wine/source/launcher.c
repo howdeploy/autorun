@@ -1839,7 +1839,7 @@ static void make_forwarder( struct launcher *l )
      * them takes a moment, and nothing is drawn while it does. */
     ui_start_screen( ui );
     ui_background( ui );
-    ui_header_back( ui, "Install forwarder", "Autorun" );
+    ui_header_back( ui, "Install forwarder", "Autorun (39-bit)" );
     ui_text_centered( ui, ui->large, ui->width / 2, ui->height / 2 - 30, "Installing...", ui->value );
     ui_present( ui );
 
@@ -3418,7 +3418,7 @@ static void settings_menu( struct launcher *l )
                                 "A forwarder made by sphaira cannot do it and stops the console.";
         snprintf( rows[SET_MAKE_MAIN].label, sizeof(rows[0].label), "Make an Autorun forwarder" );
         snprintf( rows[SET_MAKE_MAIN].value, sizeof(rows[0].value), "%s",
-                  l->options->install_forwarder ? "Autorun" : "Unavailable" );
+                  l->options->install_forwarder ? "Autorun (39-bit)" : "Unavailable" );
         rows[SET_MAKE_MAIN].help = "Installs the 39-bit Autorun forwarder. Fixed-address Win32 games also "
                                    "require the Atmosphere low-address patch. Use emuMMC only.";
         rows[SET_MAKE_MAIN].adjustable = 0;

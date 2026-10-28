@@ -3874,7 +3874,7 @@ static unsigned int launcher_install_forwarder( const char **step )
     {
         .nro_path = RUNTIME_DIR "/wine-nx-runtime.nro",
         .args = NULL,
-        .name = "Autorun",
+        .name = "Autorun (39-bit)",
         .author = "ticoverse.com",
         .icon = wine_nx_icon_any,
         .icon_size = wine_nx_icon_any_size,
