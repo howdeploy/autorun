@@ -105,8 +105,13 @@ verified fix for the reported splash-screen stall. It changes `quartz.dll`;
 replacing only the runtime NRO cannot install it. The installed DLL manifest
 still describes the pinned upstream payload. Any console trial needs the
 rebuilt x86 Quartz DLL and a retained original, without silently overwriting
-that manifest. Compilation, automated tests and a console trial of this change
-have not been run. Verbose traces were enabled in the captured session, which
+that manifest. The x86 Quartz DLL has been cross-compiled with the pinned LLVM
+toolchain; its 186 named imports resolve against the pinned 14 i386 dependency
+modules. A local installation keeps its provenance in
+`horizon-dlls/local-falloutnv-mp3.json`, separately from the upstream manifest;
+a subsequent Windows DLL update can replace the local fix. Automated tests
+and a console trial of this change have not been run. Verbose traces were
+enabled in the captured session, which
 reached the 64 MiB log limit; use a separate trace-disabled comparison before
 drawing performance conclusions.
 
