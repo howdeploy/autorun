@@ -1,9 +1,10 @@
 # Autorun: how it works
 
 Autorun (previously Wine-NX) is Wine for the Nintendo Switch. A homebrew NRO
-runs Windows programs on Horizon through libnx: 32-bit x86 programs through
-Wine's WoW64, x86-64 programs through Wine's ARM64EC loader, both with Box64
-as the CPU backend, and ARM64 programs natively. The Wine server, memory
+runs Windows programs on Horizon through libnx: the current AMD64 runtime uses
+FEX for x86/x64 guest code, with Box64 as an alternative for 32-bit programs.
+Wine supplies the WoW64/ARM64EC loading paths; the available path depends on
+the runtime build and PE architecture. The Wine server, memory
 management, exceptions and the display and input drivers are reimplemented for
 Horizon and run inside the same process.
 
@@ -11,11 +12,15 @@ The project was renamed; files and code identifiers still say `wine-nx`
 (`wine-nx-runtime.nro`, `WINE_NX_RUNTIME_BUILD`). The runtime's log is
 `logs/autorun_runtime.log`.
 
-For players, see the [README](../README.md).
+For players, see the [README](../README.md). For choosing a game runtime,
+comparing current community builds and planning measurements, see the
+[porting workflow and agent skill](porting.md).
 
 ## Status
 
-Verified on hardware:
+Historical upstream hardware reports, retained as context rather than new
+benchmarks of this fork. Our owner's current LonaRPG/New Vegas observations
+and their limits are recorded in the [porting workflow](porting.md):
 
 | Program | State |
 |---|---|
@@ -82,11 +87,12 @@ runtime; the full package now ships the Mesa 26 one.
   the Vulkan swapchain image before present (`dlls/win32u/vulkan.c`), blitted
   into the back buffer before `eglSwapBuffers` (`winnx_opengl.c`), or drawn as
   the compositor's top layer; the controller is its while it is up.
-- **Memory.** Fixed-base games such as NFSU2 need a 32-bit address space:
-  launch the NRO through a forwarder made with "32-bit, no alias", which the
-  launcher can install itself and which also raises the memory limit to 2 GiB.
-  AMD64 programs use the main 39-bit application forwarder. The same NRO
-  selects the execution path from the program's PE header.
+- **Memory.** The current launcher requires the main 39-bit application
+  forwarder for Windows games. A PE image classified as fixed-low also needs
+  the verified low-address window; a relocatable x86 image does not require
+  the legacy 32-bit forwarder just because it is x86. Inspect the PE and
+  `address_space_fits` for the runtime being used. The NRO selects the guest
+  execution path from the program's PE header.
   Wine reserves the program's low address space early, keeps its allocations
   clear of the memory Horizon hands to libnx, and leaves 32-bit programs'
   Vulkan memory in the driver's own mappings.

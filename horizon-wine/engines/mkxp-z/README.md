@@ -42,8 +42,13 @@ The local native tree is `switch-homebrew/mkxp-native`. Its engine is based on
 with our bitmap, font, filesystem, input and WASI changes. The frontend is
 [RetroArch v1.22.2](https://github.com/libretro/RetroArch/tree/69a4f0ea1e8aaf442ae4858f2e7f2b31a1776576)
 with our existing Horizon patches. Their source changes are recorded in
-`mkxp-source.patch` and `retroarch-source.patch`; game scripts and assets are separate and are not part of these
-patches. See the upstream trees for licenses and dependencies (mkxp-z GPL-2.0
+`mkxp-source.patch` and `retroarch-source.patch`; game scripts and assets are
+separate and are not part of these patches. The repository's mkxp patch is
+cumulative against `650cb08`: it includes the four local commits through
+`e590890bcde0e9c86a8e1d86758487c04e59dfe6` and subsequent working-tree changes.
+Apply it to that upstream base, not to an already patched local tree. The
+build-output receipt instead records its actual local HEAD and diff from
+that HEAD. See the upstream trees for licenses and dependencies (mkxp-z GPL-2.0
 or later; RetroArch GPL-3.0 or later).
 
 Use the existing `mkxp-libnx-build:v4-10-0` Docker image and a native tree whose

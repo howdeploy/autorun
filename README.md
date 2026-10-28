@@ -9,9 +9,12 @@
 > DXVK and game settings profiles. Start with the
 > [New Vegas preparation and migration notes](documentation/new-vegas.md).
 > [Fork diagnostics](documentation/ru-diagnostics.md) remain available.
-> The FEX/Vulkan runtime has been cross-compiled for installation; game launches
-> remain unverified. Existing TB4 binaries are historical and do not contain
-> these changes.
+> For agents and port developers, start with the
+> [porting workflow and reusable skill](documentation/porting.md).
+> The owner reports New Vegas gameplay during the introduction and a working
+> custom standalone LonaRPG engine. The new Autorun-to-mkxp integration is built
+> and installed but not yet playtested. See the workflow for evidence and limits.
+> Existing TB4 binaries are historical and do not contain these changes.
 
 <p align="center">
   Play Windows PC games on your Nintendo Switch.<br>
@@ -40,6 +43,9 @@ copies to the SD card and start them from Autorun's library.
 - **USB drives** show up in games as drives D: to H:.
 - **A launcher** with artwork, per-game settings, controls and HOME menu
   shortcuts for games.
+- **Optional native mkxp-z module** in this fork: RPG Maker XP/VX/VX Ace content
+  can be selected in the same library. See the
+  [module requirements and build](horizon-wine/engines/mkxp-z/README.md).
 
 > **Autorun is experimental.** Some games run well, many start and then stop on
 > something that isn't done yet. Every run writes a log that says where. A game
@@ -245,6 +251,12 @@ detail, at some speed cost.
 - A game may need Windows files the card doesn't have yet; the log names them.
 
 ## For developers
+
+For game adaptation and optimization, use the
+[porting workflow](documentation/porting.md) and
+[portable agent skill](skills/switch-game-porting/SKILL.md). They cover current
+community research, runtime selection, code review, comparable measurements
+and reversible deployment, with our LonaRPG and New Vegas field notes.
 
 ```sh
 sh build.sh

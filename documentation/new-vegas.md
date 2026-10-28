@@ -1,5 +1,12 @@
 # New Vegas on the howdeploy fork
 
+**Owner update, 2026-10-28:** the owner reports that New Vegas works and they
+ran around during the introduction. This establishes owner-reported gameplay.
+The report did not include a matching session/build hash, FPS measurements or
+full audio/save/long-session results; do not attribute success to one precise
+patch. The dated investigations below retain their original evidence limits.
+For the reusable process, see the [porting workflow](porting.md).
+
 Source preparation, 2026-10-28. Development branch: `main`. Upstream baseline:
 [`1ac9b6cf`](https://github.com/autorunhq/autorun/commit/1ac9b6cf37b90f2d5783dd7ef389bebbe1c68877).
 The FEX/Vulkan NRO has been cross-compiled for installation. This is not a
@@ -330,5 +337,6 @@ The FEX/DXVK/VKD3D runtime was cross-compiled in the pinned switch-dev image
 on 2026-10-28 while preparing its installation. The Linux package verifier
 uses the same `WINE_NX_LLVM_MINGW` toolchain as the build. Existing upstream
 tests are retained; the targeted host DLL checks above have been run. UI checks
-and console game launches have not been run by the agent. Interactive gameplay
-and performance remain unverified.
+and console game launches have not been run by the agent. The owner has
+subsequently confirmed introduction gameplay as noted above; measured
+performance and long-session behavior remain unverified.

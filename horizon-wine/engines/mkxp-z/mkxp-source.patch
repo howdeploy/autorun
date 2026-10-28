@@ -161,7 +161,7 @@ index 6b7f3e5..83d3f42 100644
          SANDBOX_AWAIT_R(input_controller_module, rb_define_module_under, input_module, "Controller");
          SANDBOX_AWAIT(rb_define_module_function, input_controller_module, "connected?", (VALUE (*)(ANYARGS))controller_connected, 0);
 diff --git a/binding-sandbox/wasi.cpp b/binding-sandbox/wasi.cpp
-index 426c943..7a68837 100644
+index 78ebc85..7a68837 100644
 --- a/binding-sandbox/wasi.cpp
 +++ b/binding-sandbox/wasi.cpp
 @@ -27,6 +27,8 @@
@@ -173,7 +173,22 @@ index 426c943..7a68837 100644
  #include <mkxp-sandbox-ruby.h>
  #include "filesystem.h"
  #include "core.h"
-@@ -85,6 +87,39 @@ static std::string dir_path_join(const struct wasi_instance *wasi, uint32_t fd,
+@@ -69,6 +71,14 @@ static std::string dir_path_join(const struct wasi_instance *wasi, uint32_t fd,
+     joined_path.append(wasi->str(path, path_len), path_len);
+     joined_path = mkxp_retro::fs->normalize(joined_path.c_str(), false, true);
+ 
++    // RGSS games are written for Windows, where file names are case-insensitive.
++    // If the exact path doesn't exist, use the game file with the same name in
++    // another case from the path cache (e.g. "race/moot/x.act" -> "race/Moot/x.act").
++    if (!PHYSFS_exists(joined_path.c_str())) {
++        std::string cached_path(mkxp_retro::fs->desensitize(joined_path.c_str()));
++        joined_path = std::move(cached_path);
++    }
++
+     // Verify that the joined path is a descendant of the directory corresponding to `fd`
+     if (std::strncmp(joined_path.c_str(), wasi->fdtable[fd].dir_handle()->path.c_str(), wasi->fdtable[fd].dir_handle()->path.length()) != 0) {
+         return "";
+@@ -77,6 +87,39 @@ static std::string dir_path_join(const struct wasi_instance *wasi, uint32_t fd,
      return joined_path;
  }
  
@@ -213,7 +228,7 @@ index 426c943..7a68837 100644
  struct fs_dir *wasi_file_entry::dir_handle() const noexcept {
      return (struct fs_dir *)handle;
  }
-@@ -2425,7 +2460,7 @@ extern "C" void w2c_wasi0x3Afilesystem0x2Ftypes0x4000x2E20x2E0_0x5Bmethod0x5Ddes
+@@ -2417,7 +2460,7 @@ extern "C" void w2c_wasi0x3Afilesystem0x2Ftypes0x4000x2E20x2E0_0x5Bmethod0x5Ddes
  
      wasi->check_bounds(result, 2);
  
@@ -222,7 +237,7 @@ index 426c943..7a68837 100644
          wasi->ref<uint8_t>(result) = true;
          wasi->ref<uint8_t>(result + 1) = WASI_FILESYSTEM_ERROR_BAD_DESCRIPTOR;
          return;
-@@ -2451,6 +2486,11 @@ extern "C" void w2c_wasi0x3Afilesystem0x2Ftypes0x4000x2E20x2E0_0x5Bmethod0x5Ddes
+@@ -2443,6 +2486,11 @@ extern "C" void w2c_wasi0x3Afilesystem0x2Ftypes0x4000x2E20x2E0_0x5Bmethod0x5Ddes
          case wasi_fd_type::FS:
          case wasi_fd_type::FSDIR:
              {
@@ -234,7 +249,7 @@ index 426c943..7a68837 100644
                  if (!wasi->fdtable[fd].dir_handle()->writable) {
                      wasi->ref<uint8_t>(result) = true;
                      wasi->ref<uint8_t>(result + 1) = WASI_FILESYSTEM_ERROR_READ_ONLY;
-@@ -2464,13 +2504,24 @@ extern "C" void w2c_wasi0x3Afilesystem0x2Ftypes0x4000x2E20x2E0_0x5Bmethod0x5Ddes
+@@ -2456,13 +2504,24 @@ extern "C" void w2c_wasi0x3Afilesystem0x2Ftypes0x4000x2E20x2E0_0x5Bmethod0x5Ddes
                      return;
                  }
  
@@ -260,7 +275,7 @@ index 426c943..7a68837 100644
                  PHYSFS_Stat old_stat;
                  if (!PHYSFS_stat(joined_old_path.c_str(), &old_stat)) {
                      wasi->ref<uint8_t>(result) = true;
-@@ -2542,7 +2593,7 @@ extern "C" uint32_t w2c_wasi__snapshot__preview1_path_rename(struct w2c_wasi__sn
+@@ -2534,7 +2593,7 @@ extern "C" uint32_t w2c_wasi__snapshot__preview1_path_rename(struct w2c_wasi__sn
      wasi->check_bounds(new_path, new_path_len);
      LOG_PRINTF(RETRO_LOG_DEBUG, "wasi_snapshot_preview1::path_rename(%u, \"%.*s\", %u, \"%.*s\")\n", (unsigned int)fd, (int)std::min(old_path_len, (uint32_t)INT_MAX), (const char *)wasi->str(old_path, old_path_len), (unsigned int)new_fd, (int)std::min(new_path_len, (uint32_t)INT_MAX), (const char *)wasi->str(new_path, new_path_len));
  
@@ -269,7 +284,7 @@ index 426c943..7a68837 100644
          return WASIP1_EBADF;
      }
  
-@@ -2562,6 +2613,7 @@ extern "C" uint32_t w2c_wasi__snapshot__preview1_path_rename(struct w2c_wasi__sn
+@@ -2554,6 +2613,7 @@ extern "C" uint32_t w2c_wasi__snapshot__preview1_path_rename(struct w2c_wasi__sn
          case wasi_fd_type::FS:
          case wasi_fd_type::FSDIR:
              {
@@ -277,7 +292,7 @@ index 426c943..7a68837 100644
                  if (!wasi->fdtable[fd].dir_handle()->writable) {
                      return WASIP1_EROFS;
                  }
-@@ -2571,11 +2623,15 @@ extern "C" uint32_t w2c_wasi__snapshot__preview1_path_rename(struct w2c_wasi__sn
+@@ -2563,11 +2623,15 @@ extern "C" uint32_t w2c_wasi__snapshot__preview1_path_rename(struct w2c_wasi__sn
                      return WASIP1_EPERM;
                  }
  
@@ -423,6 +438,263 @@ index 11be0be..89dce8b 100644
  
  		entry = p->ftOpenFile(std::shared_ptr<struct FileSystem::File>(new struct FileSystem::File(*mkxp_retro::fs, path)));
  		if (!entry.has_value())
+diff --git a/src/display/gl/shader.cpp b/src/display/gl/shader.cpp
+index f23a872..35d2e21 100644
+--- a/src/display/gl/shader.cpp
++++ b/src/display/gl/shader.cpp
+@@ -25,6 +25,7 @@
+ #include "sharedstate.h"
+ #include "glstate.h"
+ #include "exception.h"
++#include "switchdiag.h"
+ 
+ #include <assert.h>
+ #include <string.h>
+@@ -168,7 +169,8 @@ std::string &Shader::commonHeader() {
+ #endif
+ 
+ static void setupShaderSource(GLuint shader, GLenum type,
+-                              const unsigned char *body, int bodySize)
++                              const unsigned char *body, int bodySize,
++                              const char *dumpName)
+ {
+ 	static const char glesDefine[] = "#define GLSLES\n";
+ 	static const char fragDefine[] = "#define FRAGMENT_SHADER\n";
+@@ -204,6 +206,11 @@ static void setupShaderSource(GLuint shader, GLenum type,
+ 	shaderSrcSize[i] = bodySize;
+ 	++i;
+ 
++#ifdef MKXPZ_SWITCH_DIAG
++	mkxpzDiagDumpSource(dumpName, shaderSrc, shaderSrcSize, i);
++#else
++	(void)dumpName;
++#endif
+ 	gl.ShaderSource(shader, i, shaderSrc, shaderSrcSize);
+ }
+ 
+@@ -225,11 +232,15 @@ void Shader::init(Exception &exception,
+ 
+ 	GLint success;
+ 
++	MKXPZ_DIAG("[shader] %s: init (vertex %s, fragment %s)", programName, vertName, fragName);
++
+ 	/* Compile vertex shader */
+-	setupShaderSource(vertShader, GL_VERTEX_SHADER, vert, vertSize);
++	setupShaderSource(vertShader, GL_VERTEX_SHADER, vert, vertSize, (std::string(programName) + "." + vertName + ".vert").c_str());
++	MKXPZ_DIAG("[shader] %s: compile vertex %s", programName, vertName);
+ 	gl.CompileShader(vertShader);
+ 
+ 	gl.GetShaderiv(vertShader, GL_COMPILE_STATUS, &success);
++	MKXPZ_DIAG("[shader] %s: vertex %s status %d", programName, vertName, success);
+ 
+ 	if (!success)
+ 	{
+@@ -241,10 +252,12 @@ void Shader::init(Exception &exception,
+ 	}
+ 
+ 	/* Compile fragment shader */
+-	setupShaderSource(fragShader, GL_FRAGMENT_SHADER, frag, fragSize);
++	setupShaderSource(fragShader, GL_FRAGMENT_SHADER, frag, fragSize, (std::string(programName) + "." + fragName + ".frag").c_str());
++	MKXPZ_DIAG("[shader] %s: compile fragment %s", programName, fragName);
+ 	gl.CompileShader(fragShader);
+ 
+ 	gl.GetShaderiv(fragShader, GL_COMPILE_STATUS, &success);
++	MKXPZ_DIAG("[shader] %s: fragment %s status %d", programName, fragName, success);
+ 
+ 	if (!success)
+ 	{
+@@ -263,9 +276,11 @@ void Shader::init(Exception &exception,
+ 	gl.BindAttribLocation(program, TexCoord, "texCoord");
+ 	gl.BindAttribLocation(program, Color, "color");
+ 
++	MKXPZ_DIAG("[shader] %s: link", programName);
+ 	gl.LinkProgram(program);
+ 
+ 	gl.GetProgramiv(program, GL_LINK_STATUS, &success);
++	MKXPZ_DIAG("[shader] %s: link status %d", programName, success);
+ 
+ 	if (!success)
+ 	{
+diff --git a/src/display/gl/tileatlasvx.cpp b/src/display/gl/tileatlasvx.cpp
+index e36059c..c64247b 100644
+--- a/src/display/gl/tileatlasvx.cpp
++++ b/src/display/gl/tileatlasvx.cpp
+@@ -32,6 +32,7 @@
+ #include "glstate.h"
+ #include "texpool.h"
+ #include "util.h"
++#include "switchdiag.h"
+ 
+ #include <assert.h>
+ #include <vector>
+@@ -206,7 +207,14 @@ createShadowSet()
+ {
+ #ifdef MKXPZ_RETRO
+ 	SDL_Surface *surf = new SDL_Surface;
+-	surf->pixels = std::calloc(1*32 * 16*32, 4);
++	surf->w = 1*32;
++	surf->h = 16*32;
++	surf->pixels = std::calloc(surf->w * surf->h, 4);
++	if (surf->pixels == nullptr)
++	{
++		delete surf;
++		return nullptr;
++	}
+ #else
+ 	int bpp;
+ 	Uint32 rm, gm, bm, am;
+@@ -305,6 +313,7 @@ void build(TEXFBO &tf, Bitmap *bitmaps[BM_COUNT])
+ 	if (rgssVer >= 3)
+ 	{
+ 		SDL_Surface *shadow = createShadowSet();
++		MKXPZ_DIAG("[atlasvx] shadow set %dx%d %s", shadow ? shadow->w : -1, shadow ? shadow->h : -1, shadow ? "allocated" : "NOT allocated");
+ #ifndef MKXPZ_RETRO // TODO: implement
+ 		if (tf.selfHires != nullptr) {
+ 			SDL_Rect srcRect({0, 0, shadow->w, shadow->h});
+@@ -327,6 +336,9 @@ void build(TEXFBO &tf, Bitmap *bitmaps[BM_COUNT])
+ 				blitTemp->w, blitTemp->h, blitTemp->pixels, GL_RGBA);
+ 		}
+ 		else {
++#else
++		/* createShadowSet() returns nullptr when the pixel buffer can't be allocated */
++		if (shadow != nullptr) {
+ #endif // MKXPZ_RETRO
+ 			TEX::bind(tf.tex);
+ 			TEX::uploadSubImage(shadowArea.x*32, shadowArea.y*32,
+@@ -335,7 +347,9 @@ void build(TEXFBO &tf, Bitmap *bitmaps[BM_COUNT])
+ 		}
+ #endif // MKXPZ_RETRO
+ #ifdef MKXPZ_RETRO
+-		delete shadow;
++			std::free(shadow->pixels);
++			delete shadow;
++		}
+ #else
+ 		SDL_FreeSurface(shadow);
+ #endif // MKXPZ_RETRO
+@@ -355,6 +369,8 @@ void build(TEXFBO &tf, Bitmap *bitmaps[BM_COUNT])
+ 		} \
+ 	}
+ 
++	MKXPZ_DIAG("[atlasvx] shadow uploaded, glGetError 0x%x", gl.GetError());
++
+ 	EXEC_BLITS(A1);
+ 	EXEC_BLITS(A2);
+ 	EXEC_BLITS(A3);
+@@ -365,6 +381,8 @@ void build(TEXFBO &tf, Bitmap *bitmaps[BM_COUNT])
+ 	EXEC_BLITS(D);
+ 	EXEC_BLITS(E);
+ 
++	MKXPZ_DIAG("[atlasvx] blits done, glGetError 0x%x", gl.GetError());
++
+ #undef EXEC_BLITS
+ 
+ 	GLMeta::blitEnd();
+diff --git a/src/display/tilemapvx.cpp b/src/display/tilemapvx.cpp
+index 8818df8..89dd447 100644
+--- a/src/display/tilemapvx.cpp
++++ b/src/display/tilemapvx.cpp
+@@ -36,6 +36,7 @@
+ #include "quadarray.h"
+ #include "shader.h"
+ #include "tilemap-common.h"
++#include "switchdiag.h"
+ 
+ #include <vector>
+ #include "sigslot/signal.hpp"
+@@ -308,15 +309,26 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
+ 		shState->ensureQuadIBO(totalQuads);
+ 	}
+ 
++	/* Number of prepare/draw passes still traced to the Switch diagnostic log */
++	static int &diagPasses()
++	{
++		static int n = 8;
++		return n;
++	}
++
+ 	void prepare()
+ 	{
+ 		if (!mapData)
+ 			return;
+ 
++		const bool diag = diagPasses() > 0;
++
+ 		if (atlasDirty)
+ 		{
++			if (diag) MKXPZ_DIAG("[tilemapvx] prepare: rebuild atlas %dx%d, A1 %s", atlas.width, atlas.height, nullOrDisposed(bitmaps[BM_A1]) ? "absent" : "present");
+ 			Exception e;
+ 			rebuildAtlas(e);
++			if (diag) MKXPZ_DIAG("[tilemapvx] prepare: atlas done, error %d, glGetError 0x%x", (int)e.is_error(), gl.GetError());
+ 			if (e.is_error())
+ 				return;
+ 			atlasDirty = false;
+@@ -326,15 +338,20 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
+ 		{
+ 			updateMapViewport();
+ 			mapViewportDirty = false;
++			if (diag) MKXPZ_DIAG("[tilemapvx] prepare: map viewport %d,%d %dx%d", mapViewp.x, mapViewp.y, mapViewp.w, mapViewp.h);
+ 		}
+ 
+ 		if (buffersDirty)
+ 		{
++			if (diag) MKXPZ_DIAG("[tilemapvx] prepare: rebuild buffers");
+ 			rebuildBuffers();
+ 			buffersDirty = false;
++			if (diag) MKXPZ_DIAG("[tilemapvx] prepare: buffers done, ground %zu above %zu quads, glGetError 0x%x", groundQuads, aboveQuads, gl.GetError());
+ 		}
+ 
++		if (diag) MKXPZ_DIAG("[tilemapvx] prepare: flash map");
+ 		flashMap.prepare();
++		if (diag) MKXPZ_DIAG("[tilemapvx] prepare: done");
+ 	}
+ 
+ 	SVertex *allocVert(std::vector<SVertex> &vec, size_t count)
+@@ -348,8 +365,13 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
+ 	/* SceneElement */
+ 	void draw(Exception &exception)
+ 	{
++		const bool diag = diagPasses() > 0;
++		if (diag) MKXPZ_DIAG("[tilemapvx] draw ground");
+ 		drawGround();
++		if (diag) MKXPZ_DIAG("[tilemapvx] draw flash layer, glGetError 0x%x", gl.GetError());
+ 		drawFlashLayer();
++		if (diag) MKXPZ_DIAG("[tilemapvx] draw done, glGetError 0x%x", gl.GetError());
++		if (diag) --diagPasses();
+ 	}
+ 
+ 	void drawGround()
+@@ -375,6 +397,8 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
+ 			shader->bind();
+ 		}
+ 
++		const bool diag = diagPasses() > 0;
++		if (diag) MKXPZ_DIAG("[tilemapvx] ground: shader %s bound, uniforms", shader == &shState->shaders().simple ? "simple" : "tilemapVX");
+ 		shader->setTexSize(Vec2i(atlas.width, atlas.height));
+ 		shader->applyViewportProj();
+ 		shader->setTranslation(dispPos);
+@@ -387,7 +411,9 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
+ 		}
+ 		GLMeta::vaoBind(vao);
+ 
++		if (diag) MKXPZ_DIAG("[tilemapvx] ground: DrawElements %zu quads, glGetError 0x%x", groundQuads, gl.GetError());
+ 		gl.DrawElements(GL_TRIANGLES, groundQuads*6, _GL_INDEX_TYPE, 0);
++		if (diag) MKXPZ_DIAG("[tilemapvx] ground: DrawElements returned, glGetError 0x%x", gl.GetError());
+ 
+ 		GLMeta::vaoUnbind(vao);
+ 	}
+@@ -411,8 +437,11 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
+ 		}
+ 		GLMeta::vaoBind(vao);
+ 
++		const bool diag = diagPasses() > 0;
++		if (diag) MKXPZ_DIAG("[tilemapvx] above: DrawElements %zu quads", aboveQuads);
+ 		gl.DrawElements(GL_TRIANGLES, aboveQuads*6, _GL_INDEX_TYPE,
+ 		                (GLvoid*) (groundQuads*6*sizeof(index_t)));
++		if (diag) MKXPZ_DIAG("[tilemapvx] above: DrawElements returned, glGetError 0x%x", gl.GetError());
+ 
+ 		GLMeta::vaoUnbind(vao);
+ 	}
 diff --git a/src/filesystem/filesystem.cpp b/src/filesystem/filesystem.cpp
 index 98890ba..0f5b7a7 100644
 --- a/src/filesystem/filesystem.cpp
@@ -518,3 +790,72 @@ index 82003b0..3c5013d 100644
      unsigned int rawKeyStatesLength();
      uint8_t *rawButtonStates();
      unsigned int rawButtonStatesLength();
+diff --git a/src/util/switchdiag.h b/src/util/switchdiag.h
+new file mode 100644
+index 0000000..2420ddd
+--- /dev/null
++++ b/src/util/switchdiag.h
+@@ -0,0 +1,63 @@
++/*
++** switchdiag.h
++**
++** Diagnostic trace for the Nintendo Switch libretro build (LonaRPG port).
++** Enabled only with -DMKXPZ_SWITCH_DIAG. Each line is appended to
++** /mkxp/logs/mkxp-diag.log on the SD card and flushed after every line,
++** so the last line survives an abort() in the graphics driver.
++*/
++
++#ifndef SWITCHDIAG_H
++#define SWITCHDIAG_H
++
++#ifdef MKXPZ_SWITCH_DIAG
++
++#include <cstdarg>
++#include <cstdio>
++#include <string>
++#include <sys/stat.h>
++
++inline FILE *mkxpzDiagFile()
++{
++	static FILE *f = std::fopen("/mkxp/logs/mkxp-diag.log", "a");
++	return f;
++}
++
++inline void mkxpzDiag(const char *fmt, ...)
++{
++	FILE *f = mkxpzDiagFile();
++	if (f == nullptr)
++		return;
++	va_list args;
++	va_start(args, fmt);
++	std::vfprintf(f, fmt, args);
++	va_end(args);
++	std::fputc('\n', f);
++	std::fflush(f);
++}
++
++/* Writes the exact source parts passed to glShaderSource into one file */
++inline void mkxpzDiagDumpSource(std::string name, const char *const *parts, const int *sizes, size_t count)
++{
++	/* Program names such as "BlurShader::HPass" are not valid FAT file names */
++	for (char &c : name)
++		if (c == ':')
++			c = '_';
++	mkdir("/mkxp/logs/glsl", 0777);
++	FILE *f = std::fopen(("/mkxp/logs/glsl/" + name).c_str(), "wb");
++	if (f == nullptr)
++	{
++		mkxpzDiag("[diag] cannot write /mkxp/logs/glsl/%s", name.c_str());
++		return;
++	}
++	for (size_t i = 0; i < count; ++i)
++		std::fwrite(parts[i], 1, sizes[i], f);
++	std::fclose(f);
++}
++
++#  define MKXPZ_DIAG(...) mkxpzDiag(__VA_ARGS__)
++#else
++#  define MKXPZ_DIAG(...) ((void)0)
++#endif // MKXPZ_SWITCH_DIAG
++
++#endif // SWITCHDIAG_H

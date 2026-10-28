@@ -1,0 +1,4 @@
+interface:
+  display_name: "Switch Game Porting"
+  short_description: "Research and adapt PC games for a specific Switch"
+  default_prompt: "Use $switch-game-porting to inspect my game and Switch, compare current community runtimes, and prepare the smallest compatible change with evidence and rollback."
