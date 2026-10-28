@@ -1,0 +1,415 @@
+/* Exercise the real backend with an audout ownership simulator. */
+#include <assert.h>
+#include <stdio.h>
+#include "../source/audio_unix.c"
+
+static AudioOutBuffer *queued[NX_BUFFERS];
+static unsigned int queued_count, ready;
+static BOOL host_started;
+Result audoutInitialize(void) { return 0; }
+void audoutExit(void) { queued_count = ready = 0; host_started = FALSE; }
+Result audoutStartAudioOut(void) { host_started = TRUE; return 0; }
+Result audoutStopAudioOut(void) { host_started = FALSE; return 0; }
+Result audoutAppendAudioOutBuffer(AudioOutBuffer *b)
+{
+    unsigned int i;
+    assert(queued_count < NX_BUFFERS);
+    assert(!((UINT_PTR)b->buffer & 0xfff));
+    assert(b->data_size <= b->buffer_size);
+    for (i = 0; i < queued_count; i++) assert(queued[i] != b);
+    queued[queued_count++] = b;
+    return 0;
+}
+Result audoutGetReleasedAudioOutBuffer(AudioOutBuffer **b, u32 *count)
+{
+    *count = 0; *b = NULL;
+    if (ready && queued_count)
+    {
+        unsigned int i;
+        *b = queued[0]; *count = 1;
+        for (i = 0; i + 1 < queued_count; i++) queued[i] = queued[i + 1];
+        queued_count--; ready--;
+    }
+    return 0;
+}
+void armDCacheFlush(void *p, size_t size) { (void)p; (void)size; }
+Result svcSetThreadPriority(Handle h, u32 priority) { (void)h; (void)priority; return 0; }
+void *memalign(size_t alignment, size_t size)
+{ void *p = NULL; if (posix_memalign(&p, alignment, size)) return NULL; return p; }
+NTSTATUS WINAPI NtAllocateVirtualMemory(HANDLE proc, void **p, ULONG_PTR bits, SIZE_T *size, ULONG type, ULONG prot)
+{
+    (void)proc; (void)type; (void)prot;
+    assert(bits == 0xffffffff00000000ULL);
+    *p = calloc(1, *size); return *p ? 0 : STATUS_NO_MEMORY;
+}
+NTSTATUS WINAPI NtFreeVirtualMemory(HANDLE proc, void **p, SIZE_T *size, ULONG type)
+{ (void)proc; (void)size; (void)type; free(*p); *p = NULL; return 0; }
+NTSTATUS WINAPI NtSetEvent(HANDLE event, LONG *state) { (void)event; (void)state; return 0; }
+NTSTATUS WINAPI NtWaitForSingleObject(HANDLE h, BOOLEAN alert, const LARGE_INTEGER *time)
+{ (void)h; (void)alert; (void)time; return 0; }
+NTSTATUS WINAPI NtClose(HANDLE h) { (void)h; return 0; }
+NTSTATUS WINAPI NtDelayExecution(BOOLEAN alert, const LARGE_INTEGER *time)
+{ (void)alert; (void)time; return 0; }
+NTSTATUS WINAPI NtQueryPerformanceCounter(LARGE_INTEGER *n, LARGE_INTEGER *f)
+{ n->QuadPart = 10000000; if (f) f->QuadPart = 10000000; return 0; }
+NTSTATUS WINAPI PsCreateSystemThread(PHANDLE handle, ULONG access, POBJECT_ATTRIBUTES attrs,
+                                    HANDLE process, PCLIENT_ID client, PRTL_THREAD_START_ROUTINE start, PVOID arg)
+{ (void)access; (void)attrs; (void)process; (void)client; (void)start; (void)arg; *handle = (HANDLE)1; return 0; }
+void WINAPI RtlInitUnicodeString(PUNICODE_STRING string, PCWSTR source)
+{ string->Buffer = (WCHAR *)source; string->Length = string->MaximumLength = 0; }
+NTSTATUS WINAPI NtSetInformationThread(HANDLE thread, THREADINFOCLASS info, LPCVOID data, ULONG size)
+{ (void)thread; (void)info; (void)data; (void)size; return 0; }
+
+static WAVEFORMATEXTENSIBLE channel_format(unsigned int channels, DWORD mask, unsigned int bits)
+{
+    WAVEFORMATEXTENSIBLE fmt = {0};
+    fmt.Format = (WAVEFORMATEX){WAVE_FORMAT_EXTENSIBLE, channels, NX_RATE,
+        NX_RATE * channels * bits / 8, channels * bits / 8, bits, 22};
+    fmt.Samples.wValidBitsPerSample = bits;
+    fmt.dwChannelMask = mask;
+    fmt.SubFormat = bits == 32 ? nx_subtype_float : nx_subtype_pcm;
+    return fmt;
+}
+
+static void test_channel_layout(unsigned int channels, DWORD mask, const float weights[][2])
+{
+    WAVEFORMATEXTENSIBLE fmt = channel_format(channels, mask, 32);
+    stream_handle handle = 0;
+    UINT32 count = 0;
+    BYTE *data;
+    struct create_stream_params create = {.flow=eRender, .share=AUDCLNT_SHAREMODE_SHARED,
+        .duration=300000, .fmt=&fmt.Format, .channel_count=&count, .stream=&handle,
+        .flags=AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM};
+    struct get_render_buffer_params get = {.frames=channels + 2, .data=&data};
+    struct release_render_buffer_params put = {.written_frames=channels + 2};
+    struct start_params start;
+    struct set_event_handle_params event = {.event=(HANDLE)1};
+    struct release_stream_params release;
+    struct set_volumes_params volume;
+    float vols[NX_MAX_CHANNELS], session[NX_MAX_CHANNELS];
+    float totals[2] = {0};
+    struct nx_audio_stream *s;
+    short *out;
+    unsigned int i, c;
+
+    nx_create_stream(&create);
+    assert(create.result == S_OK && count == channels && handle);
+    s = nx_stream(handle);
+    get.stream = put.stream = start.stream = event.stream = release.stream = handle;
+    nx_set_event_handle(&event); assert(event.result == S_OK);
+    nx_get_render_buffer(&get); assert(get.result == S_OK);
+    memset(data, 0, get.frames * fmt.Format.nBlockAlign);
+    for (c = 0; c < channels; c++)
+    {
+        ((float *)data)[c * channels + c] = 1;
+        ((float *)data)[channels * channels + c] = 1;
+        ((float *)data)[(channels + 1) * channels + c] = -1;
+        totals[0] += weights[c][0]; totals[1] += weights[c][1];
+        vols[c] = session[c] = 1;
+    }
+    nx_release_render_buffer(&put); assert(put.result == S_OK);
+    nx_start(&start); assert(start.result == S_OK && queued_count == 1);
+    out = queued[0]->buffer;
+    for (c = 0; c < channels; c++) for (i = 0; i < 2; i++)
+        assert(abs(out[c * 2 + i] - (int)(weights[c][i] * 32767)) <= 2);
+    for (i = 0; i < 2; i++)
+    {
+        assert(abs(out[channels * 2 + i] - (int)(totals[i] * 32767)) <= 2);
+        assert(abs(out[(channels + 1) * 2 + i] + (int)(totals[i] * 32767)) <= 2);
+    }
+    ready = 1; nx_pump(); assert(!s->held && !queued_count);
+
+    get.frames = put.written_frames = 1;
+    for (c = 0; c < channels; c++)
+    {
+        nx_get_render_buffer(&get); assert(get.result == S_OK);
+        memset(data, 0, fmt.Format.nBlockAlign);
+        ((float *)data)[c] = 1;
+        nx_release_render_buffer(&put); assert(put.result == S_OK);
+        /* Changes after submission must affect queued audio exactly once. */
+        vols[c] = .5f; session[c] = .5f;
+        volume = (struct set_volumes_params){handle, .5f, vols, session};
+        nx_set_volumes(&volume);
+        nx_pump(); assert(queued_count == 1);
+        out = queued[0]->buffer;
+        for (i = 0; i < 2; i++)
+            assert(abs(out[i] - (int)(weights[c][i] * 32767 * .125f)) <= 2);
+        ready = 1; nx_pump();
+        vols[c] = session[c] = 1;
+        volume.master_volume = 1; nx_set_volumes(&volume);
+    }
+    put.flags = AUDCLNT_BUFFERFLAGS_SILENT;
+    s->read = s->capacity - 1;
+    get.frames = put.written_frames = 2;
+    nx_get_render_buffer(&get); assert(get.result == S_OK);
+    memset(data, 0xff, get.frames * fmt.Format.nBlockAlign);
+    nx_release_render_buffer(&put); assert(put.result == S_OK);
+    nx_pump(); assert(queued_count == 1);
+    out = queued[0]->buffer;
+    assert(!out[0] && !out[1] && !out[2] && !out[3]);
+    ready = 1; nx_pump(); assert(!s->held && s->read == 1);
+    nx_release_stream(&release); assert(release.result == S_OK && !active && !queued_count);
+}
+
+static void test_multichannel(void)
+{
+    const float root = .70710678f, scale = 1 + root * 2 + .5f;
+    const float surround[][2] = {{1/scale,0}, {0,1/scale}, {root/scale,root/scale},
+        {.5f/scale,.5f/scale}, {root/scale,0}, {0,root/scale}};
+    const float quad[][2] = {{1/(1+root),0}, {0,1/(1+root)}, {root/(1+root),0}, {0,root/(1+root)}};
+    const float stereo[][2] = {{1,0}, {0,1}};
+    const float mono[][2] = {{1,1}};
+    const float seven_scale = scale + root;
+    const float seven[][2] = {{1/seven_scale,0}, {0,1/seven_scale}, {root/seven_scale,root/seven_scale},
+        {.5f/seven_scale,.5f/seven_scale}, {root/seven_scale,0}, {0,root/seven_scale},
+        {root/seven_scale,0}, {0,root/seven_scale}};
+    const float left_center[][2] = {{1/(1+root),0}, {root/(1+root),root/(1+root)}};
+    WAVEFORMATEXTENSIBLE fmt = channel_format(6, 0x3f, 32);
+    struct is_format_supported_params supported = {.flow=eRender, .share=AUDCLNT_SHAREMODE_SHARED, .fmt_in=&fmt.Format};
+
+    test_channel_layout(1, SPEAKER_FRONT_CENTER, mono);
+    test_channel_layout(2, 3, stereo);
+    test_channel_layout(4, 0x33, quad);
+    test_channel_layout(6, 0x3f, surround);
+    test_channel_layout(6, 0x60f, surround);
+    test_channel_layout(8, 0x63f, seven);
+    test_channel_layout(2, SPEAKER_FRONT_LEFT | SPEAKER_FRONT_CENTER, left_center);
+    nx_is_format_supported(&supported); assert(supported.result == S_OK);
+    supported.share = AUDCLNT_SHAREMODE_EXCLUSIVE;
+    nx_is_format_supported(&supported); assert(supported.result == AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED);
+    supported.share = AUDCLNT_SHAREMODE_SHARED;
+    fmt.dwChannelMask = 0;
+    nx_is_format_supported(&supported); assert(supported.result == AUDCLNT_E_UNSUPPORTED_FORMAT);
+    fmt.dwChannelMask = 0x8000003f;
+    assert(!nx_format(&fmt.Format));
+    fmt = channel_format(9, 0x1ff, 32); assert(!nx_format(&fmt.Format));
+    fmt = channel_format(6, 0x3f, 32);
+    fmt.Format.cbSize = 0; assert(!nx_format(&fmt.Format));
+    fmt.Format.wFormatTag = WAVE_FORMAT_IEEE_FLOAT; assert(!nx_format(&fmt.Format));
+}
+
+static void test_pcm_channels(void)
+{
+    static const BYTE samples[][4] = {{0,0,0,0}, {0,0xc0,0,0}, {0,0,0xc0,0}, {0,0,0,0xc0}};
+    static const short expected[] = {-32768, -16384, -16384, -16384};
+    unsigned int bits, c;
+    for (bits = 8; bits <= 32; bits += 8)
+    {
+        WAVEFORMATEXTENSIBLE fmt = channel_format(6, 0x3f, bits);
+        stream_handle handle;
+        UINT32 channels;
+        BYTE *data;
+        struct create_stream_params create = {.flow=eRender, .share=AUDCLNT_SHAREMODE_SHARED,
+            .duration=300000, .fmt=&fmt.Format, .channel_count=&channels, .stream=&handle};
+        struct get_render_buffer_params get = {.frames=1, .data=&data};
+        struct release_render_buffer_params put = {.written_frames=1};
+        struct release_stream_params release;
+        fmt.SubFormat = nx_subtype_pcm;
+        nx_create_stream(&create); assert(create.result == S_OK && channels == 6);
+        get.stream = put.stream = release.stream = handle;
+        nx_get_render_buffer(&get); assert(get.result == S_OK);
+        for (c = 0; c < 6; c++) memcpy(data + c * bits / 8, samples[bits / 8 - 1], bits / 8);
+        nx_release_render_buffer(&put); assert(put.result == S_OK);
+        for (c = 0; c < 6; c++) assert(((short *)nx_stream(handle)->ring)[c] == expected[bits / 8 - 1]);
+        nx_release_stream(&release); assert(release.result == S_OK);
+    }
+}
+
+int main(void)
+{
+    struct test_connect_params connect = {0};
+    WAVEFORMATEX fmt = {WAVE_FORMAT_PCM,2,48000,192000,4,16,0};
+    stream_handle handle = 0;
+    UINT32 channels = 0;
+    struct create_stream_params create = {.flow=eRender, .share=AUDCLNT_SHAREMODE_SHARED,
+        .duration=400000, .fmt=&fmt, .channel_count=&channels, .stream=&handle};
+    const unsigned int total = (NX_BUFFERS + 1) * NX_CHUNK;
+    BYTE *data = NULL;
+    struct get_render_buffer_params get = {.frames=total, .data=&data};
+    struct release_render_buffer_params put = {.written_frames=total};
+    struct start_params startp;
+    struct stop_params stopp;
+    struct reset_params resetp;
+    struct release_stream_params release;
+    struct nx_audio_stream *s;
+    unsigned int i, cycles, before;
+    BOOL wrapped = FALSE;
+    wine_nx_audio_unix_funcs[test_connect](&connect); assert(connect.priority == Priority_Preferred);
+    wine_nx_audio_unix_funcs[create_stream](&create); assert(create.result == S_OK && channels == 2 && handle);
+    s = nx_stream(handle);
+    get.stream = put.stream = handle;
+    wine_nx_audio_unix_funcs[get_render_buffer](&get);
+    assert(get.result == S_OK && data && (UINT_PTR)data > 0xffffffffu);
+    for (i = 0; i < total; i++) { ((short *)data)[i*2] = i; ((short *)data)[i*2+1] = -i; }
+    nx_release_render_buffer(&put); assert(put.result == S_OK && s->held == total);
+    startp.stream = handle; nx_start(&startp);
+    /* Only what audout can hold goes out; the rest stays owned by the ring. */
+    assert(startp.result == S_OK && host_started && queued_count == NX_BUFFERS);
+    assert(s->held == total && s->submitted == NX_BUFFERS * NX_CHUNK && !s->played);
+    assert(((short *)queued[0]->buffer)[2] == 1);
+    assert(((short *)queued[1]->buffer)[0] == NX_CHUNK);
+    nx_pump(); assert(s->held == total && !s->played);
+    ready = 1; nx_pump();
+    assert(s->held == total - NX_CHUNK && s->played == NX_CHUNK && queued_count == NX_BUFFERS);
+    assert(((short *)queued[NX_BUFFERS - 1]->buffer)[0] == (short)(NX_BUFFERS * NX_CHUNK));
+    ready = NX_BUFFERS; nx_pump();
+    assert(!s->held && s->played == total && !queued_count);
+    /* Cross the ring boundary, preserving order and silence. */
+    put.flags = AUDCLNT_BUFFERFLAGS_SILENT;
+    for (cycles = 0; cycles < 2 * s->capacity / NX_CHUNK; cycles++)
+    {
+        before = s->read;
+        get.frames = put.written_frames = NX_CHUNK;
+        nx_get_render_buffer(&get); assert(get.result == S_OK);
+        nx_release_render_buffer(&put); assert(put.result == S_OK);
+        nx_pump(); assert(queued_count == 1);
+        for (i = 0; i < NX_CHUNK; i++) assert(((short *)queued[0]->buffer)[i*2] == 0);
+        ready = 1; nx_pump();
+        if (s->read < before) wrapped = TRUE;
+    }
+    assert(wrapped);
+    resetp.stream = handle; nx_reset(&resetp); assert(resetp.result == AUDCLNT_E_NOT_STOPPED);
+    stopp.stream = handle; nx_stop(&stopp); assert(stopp.result == S_OK && !host_started);
+    nx_reset(&resetp); assert(resetp.result == S_OK && !s->held && !s->played && !queued_count);
+    get.frames = s->capacity + 1; nx_get_render_buffer(&get); assert(get.result == AUDCLNT_E_BUFFER_TOO_LARGE);
+    get.frames = 1; nx_get_render_buffer(&get); assert(get.result == S_OK);
+    nx_get_render_buffer(&get); assert(get.result == AUDCLNT_E_OUT_OF_ORDER);
+    put.written_frames = 2; nx_release_render_buffer(&put); assert(put.result == AUDCLNT_E_INVALID_SIZE);
+    nx_reset(&resetp); assert(resetp.result == AUDCLNT_E_BUFFER_OPERATION_PENDING);
+    put.written_frames = 0; nx_release_render_buffer(&put); assert(put.result == S_OK);
+    release.stream = handle; nx_release_stream(&release);
+    assert(release.result == S_OK && !active && !queued_count);
+    /* Common application format: mono 44.1 kHz float is converted to the
+     * Switch's stereo 48 kHz signed-16 stream. */
+    {
+        WAVEFORMATEX converted = {WAVE_FORMAT_IEEE_FLOAT, 1, 44100, 176400, 4, 32, 0};
+        struct create_stream_params converted_create = {.flow=eRender, .share=AUDCLNT_SHAREMODE_SHARED,
+            .duration=400000, .fmt=&converted, .channel_count=&channels, .stream=&handle};
+        float *source;
+        nx_create_stream(&converted_create);
+        assert(converted_create.result == S_OK && handle);
+        get.stream = put.stream = handle; get.frames = put.written_frames = 441;
+        nx_get_render_buffer(&get); assert(get.result == S_OK);
+        source = (float *)data;
+        for (i = 0; i < 441; i++) source[i] = i == 0 ? 0.5f : 0.0f;
+        nx_release_render_buffer(&put); assert(put.result == S_OK && nx_stream(handle)->held == 480);
+        release.stream = handle; nx_release_stream(&release);
+        assert(release.result == S_OK);
+    }
+    /* Shared clients may select float without changing the mix format's valid bits. */
+    {
+        WAVEFORMATEXTENSIBLE mix, ds;
+        struct get_mix_format_params mixp = {.flow=eRender, .fmt=&mix};
+        struct is_format_supported_params supported = {.flow=eRender, .share=AUDCLNT_SHAREMODE_SHARED, .fmt_in=&ds.Format};
+        struct create_stream_params ds_create = {.flow=eRender, .share=AUDCLNT_SHAREMODE_SHARED,
+            .flags=AUDCLNT_STREAMFLAGS_NOPERSIST | AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+            .duration=800000, .fmt=&ds.Format, .channel_count=&channels, .stream=&handle};
+        float *source;
+        nx_get_mix_format(&mixp);
+        assert(mixp.result == S_OK && mix.Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE);
+        assert(mix.Format.nChannels == 2 && mix.dwChannelMask == 0x3);
+        assert(mix.Format.wBitsPerSample == 32 && mix.Samples.wValidBitsPerSample == 32);
+        assert(mix.Format.nBlockAlign == 8 && mix.Format.nAvgBytesPerSec == NX_RATE * 8);
+        assert(!memcmp(&mix.SubFormat, &nx_subtype_float, sizeof(GUID)));
+        assert(nx_format(&mix.Format));
+        ds = mix;
+        ds.SubFormat = nx_subtype_float;
+        ds.Format.wBitsPerSample = 32;
+        ds.Format.nBlockAlign = ds.Format.nChannels * ds.Format.wBitsPerSample / 8;
+        ds.Format.nAvgBytesPerSec = ds.Format.nSamplesPerSec * ds.Format.nBlockAlign;
+        assert(ds.Format.cbSize == sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX));
+        assert(ds.Samples.wValidBitsPerSample == ds.Format.wBitsPerSample);
+        nx_is_format_supported(&supported); assert(supported.result == S_OK);
+        nx_create_stream(&ds_create); assert(ds_create.result == S_OK && handle);
+        assert(nx_stream(handle)->source_tag == WAVE_FORMAT_IEEE_FLOAT);
+        get.stream = put.stream = handle; get.frames = put.written_frames = 480;
+        put.flags = 0;  /* the ring-wrap loop above left AUDCLNT_BUFFERFLAGS_SILENT set */
+        nx_get_render_buffer(&get); assert(get.result == S_OK);
+        source = (float *)data;
+        for (i = 0; i < 960; i++) source[i] = i == 0 ? 0.5f : 0.0f;
+        nx_release_render_buffer(&put); assert(put.result == S_OK && nx_stream(handle)->held == 480);
+        /* float, not read as 32-bit PCM */
+        assert(((short *)nx_stream(handle)->ring)[0] == 16383 && ((short *)nx_stream(handle)->ring)[1] == 0);
+        release.stream = handle; nx_release_stream(&release);
+        assert(release.result == S_OK);
+    }
+    {
+        BYTE endpoint_buffer[256];
+        struct get_endpoint_ids_params endpoints =
+        {
+            .flow = eRender, .endpoints = (struct endpoint *)endpoint_buffer,
+            .size = sizeof(endpoint_buffer)
+        };
+        WCHAR driver[8] = {0xcccc};
+        UINT err = 0xcccc;
+        BOOL quit = FALSE;
+        struct notify_context notify = {.send_notify = TRUE};
+        struct midi_init_params midi_init_params = {.err = &err};
+        struct midi_out_message_params midi_out = {.msg = MODM_GETNUMDEVS, .err = &err, .notify = &notify};
+        struct midi_in_message_params midi_in = {.msg = MIDM_OPEN, .err = &err, .notify = &notify};
+        struct midi_notify_wait_params midi_wait = {.quit = &quit, .notify = &notify};
+        struct aux_message_params aux = {.msg = AUXDM_GETNUMDEVS, .err = &err};
+
+        assert((UINT_PTR)&endpoints > 0xffffffffu && (UINT_PTR)endpoint_buffer > 0xffffffffu);
+        wine_nx_audio_unix_funcs[get_endpoint_ids](&endpoints);
+        assert(endpoints.result == S_OK && endpoints.num == 1 && endpoints.size <= sizeof(endpoint_buffer));
+        wine_nx_audio_unix_funcs[midi_get_driver](driver);
+        assert(!driver[0]);
+        wine_nx_audio_unix_funcs[midi_init](&midi_init_params);
+        assert(!err);
+        wine_nx_audio_unix_funcs[midi_out_message](&midi_out);
+        assert(!err && !notify.send_notify);
+        notify.send_notify = TRUE;
+        wine_nx_audio_unix_funcs[midi_in_message](&midi_in);
+        assert(err == MMSYSERR_BADDEVICEID && !notify.send_notify);
+        notify.send_notify = TRUE;
+        wine_nx_audio_unix_funcs[midi_notify_wait](&midi_wait);
+        assert(quit && !notify.send_notify);
+        wine_nx_audio_unix_funcs[aux_message](&aux);
+        assert(!err);
+        aux.msg = AUXDM_GETDEVCAPS;
+        wine_nx_audio_unix_funcs[aux_message](&aux);
+        assert(err == MMSYSERR_BADDEVICEID);
+    }
+    {
+        stream_handle a = 0, b = 0;
+        struct create_stream_params first = create, second = create;
+        struct nx_audio_stream *stream_a, *stream_b;
+        first.stream = &a;
+        second.stream = &b;
+        nx_create_stream(&first);
+        nx_create_stream(&second);
+        assert(first.result == S_OK && second.result == S_OK && a && b);
+        stream_a = nx_stream(a);
+        stream_b = nx_stream(b);
+        startp.stream = a; nx_start(&startp); assert(startp.result == S_OK);
+        startp.stream = b; nx_start(&startp); assert(startp.result == S_OK);
+        for (i = 0; i < 2; i++)
+        {
+            get.stream = put.stream = i ? b : a;
+            get.frames = put.written_frames = NX_CHUNK;
+            nx_get_render_buffer(&get); assert(get.result == S_OK);
+            for (unsigned int j = 0; j < NX_CHUNK * 2; j++) ((short *)data)[j] = 20000;
+            nx_release_render_buffer(&put); assert(put.result == S_OK);
+        }
+        nx_pump();
+        assert(queued_count == 1 && ((short *)queued[0]->buffer)[0] == 32767);
+        stopp.stream = a; nx_stop(&stopp); assert(stopp.result == S_OK && host_started);
+        ready = 1; nx_pump();
+        assert(!stream_a->held && !stream_b->held && stream_a->played == NX_CHUNK);
+        release.stream = a; nx_release_stream(&release);
+        assert(release.result == S_OK && active == stream_b && host_started);
+        get.stream = put.stream = b;
+        nx_get_render_buffer(&get); assert(get.result == S_OK);
+        for (i = 0; i < NX_CHUNK * 2; i++) ((short *)data)[i] = -1000;
+        nx_release_render_buffer(&put); assert(put.result == S_OK);
+        nx_pump();
+        assert(queued_count == 1 && ((short *)queued[0]->buffer)[0] == -1000);
+        release.stream = b; nx_release_stream(&release);
+        assert(release.result == S_OK && !active && !host_started && !queued_count);
+    }
+    test_multichannel();
+    test_pcm_channels();
+    puts("Audio backend: playback, multichannel mixing, channel volumes and formats passed");
+    return 0;
+}

@@ -1,5 +1,23 @@
 # Russian UI and Wi-Fi diagnostics
 
+## Current development: main
+
+The fork now integrates upstream `1ac9b6cf` on `main`. Runtime sources live in
+`horizon-wine/`; the existing FTP server, language selection, session logs,
+bounded event logs and ZIP reports are retained. The updater still uses
+`howdeploy/autorun`, not upstream. New upstream UI strings without a translation
+fall back to English.
+
+Use the [New Vegas preparation and migration notes](new-vegas.md) for the
+current build and installation plan. The older RU NROs below are Mesa 20.1/TB4
+artifacts, not builds of current `main`. The old Mesa-specific presentation
+guards are superseded by the current Mesa 26 and upstream window handling.
+The checked Box64 option remains opt-in for RGSS diagnosis; leave it off for
+New Vegas. Its historical runtime validation does not establish compatibility
+of this merged source.
+
+## Historical TB4 builds and experiments
+
 This fork starts at upstream `test-build-4`, commit
 `9b7170505f9084fee0ffe1a237b08557a6ab2868`. It keeps the upstream launcher layout,
 controller navigation and runtime data format. The existing Home, Library,

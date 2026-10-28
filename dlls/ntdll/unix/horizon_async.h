@@ -40,6 +40,7 @@
 #define HORIZON_ASYNC_IO          0  /* a recv or send, which the client does */
 #define HORIZON_ASYNC_ACCEPT      1  /* accept(): the server makes a new socket */
 #define HORIZON_ASYNC_ACCEPT_INTO 2  /* AcceptEx: the server accepts into the socket given */
+#define HORIZON_ASYNC_PIPE_LISTEN 3
 
 #define HORIZON_ASYNC_STATUS_ALERTED   0x00000101u  /* the operation is to be done now */
 #define HORIZON_ASYNC_STATUS_CANCELLED 0xc0000120u
@@ -78,6 +79,7 @@ struct horizon_async
     struct horizon_async_data data;
     unsigned int status;       /* what the APC tells the client: ALERTED to do it, or how it ended */
     unsigned long long ready_at;
+    unsigned long long deadline;
     /* The socket's completion port as it was when the operation started,
      * referenced, which is where the result goes even if the socket is closed
      * before it comes. */

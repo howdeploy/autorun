@@ -7,7 +7,8 @@
 /* The runtime's folder: system.reg and user.reg are in its registry/, the
  * classes the payload ships in config/. The host test uses a scratch folder. */
 #ifndef HORIZON_REGISTRY_DIR
-#define HORIZON_REGISTRY_DIR "sdmc:/switch/wine/"
+#include "horizon_runtime_paths.h"
+#define HORIZON_REGISTRY_DIR WINE_NX_RUNTIME_ROOT "/"
 #endif
 #include "horizon_registry_paths.h"
 
@@ -108,6 +109,8 @@ struct horizon_registry_path
     const struct horizon_registry_path *parent;  /* NULL for a child of the hive */
 };
 
+static struct horizon_reg_key *horizon_registry_session_key, *horizon_registry_session_saved;
+
 /* server/registry.c's dump_path: elements are separated by an escaped backslash. */
 static void horizon_registry_save_path( FILE *file, const struct horizon_registry_path *path )
 {
@@ -146,6 +149,11 @@ static void horizon_registry_save_subkeys( FILE *file, const struct horizon_reg_
     for (i = 0; i < key->subkey_count; i++)
     {
         child.key = key->subkeys[i];
+        horizon_registry_save_subkeys( file, child.key, &child );
+    }
+    if (horizon_registry_session_saved && key == horizon_registry_session_saved->parent)
+    {
+        child.key = horizon_registry_session_saved;
         horizon_registry_save_subkeys( file, child.key, &child );
     }
 }
@@ -295,11 +303,26 @@ static unsigned int horizon_registry_init(void)
     {
         static const char machine_seed[] =
             "WINE REGISTRY Version 2\n"
+            "[System\\\\CurrentControlSet\\\\Control\\\\ComputerName\\\\ComputerName]\n"
+            "\"ComputerName\"=\"WINE-NX\"\n"
+            "[System\\\\CurrentControlSet\\\\Control\\\\ComputerName\\\\ActiveComputerName]\n"
+            "\"ComputerName\"=\"WINE-NX\"\n"
+            "[System\\\\CurrentControlSet\\\\Services\\\\Tcpip\\\\Parameters]\n"
+            "\"Hostname\"=\"wine-nx\"\n"
+            "\"Domain\"=\"\"\n"
             "[Software\\\\Classes\\\\CLSID\\\\{BCDE0395-E52F-467C-8E3D-C4579291692E}\\\\InprocServer32]\n"
             "@=\"mmdevapi.dll\"\n"
-            "\"ThreadingModel\"=\"Both\"\n";
+            "\"ThreadingModel\"=\"Both\"\n"
+            "[Software\\\\NVIDIA Corporation\\\\PhysX\\\\Runtimes]\n"
+            "\"PhysXCore Path\"=\"C:\\\\physx\\\\Engine\"\n"
+            /* What wine.inf writes at wineboot, which never runs here. Aspyr's
+             * AWL.dll looks for a drive in it and, finding none, has Guitar Hero
+             * III say "Windows Virtual Memory must be enabled". */
+            "[System\\\\CurrentControlSet\\\\Control\\\\Session Manager\\\\Memory Management]\n"
+            "\"PagingFiles\"=\"C:\\\\pagefile.sys 27 77\"\n";
         static const char user_seed[] =
-            "WINE REGISTRY Version 2\n[Software\\\\Wine\\\\Drivers]\n\"Audio\"=\"nxaudio\"\n";
+            "WINE REGISTRY Version 2\n[Software\\\\Wine\\\\Drivers]\n\"Audio\"=\"nxaudio\"\n"
+            "[Software\\\\Wine\\\\MediaFoundation]\n\"DisableGstByteStreamHandler\"=dword:00000001\n";
         unsigned int errors = 0;
         if (horizon_reg_load( &horizon_registry, machine, machine_seed, sizeof(machine_seed) - 1, &errors ) ||
             horizon_reg_load( &horizon_registry, user, user_seed, sizeof(user_seed) - 1, &errors ) || errors)
@@ -309,14 +332,14 @@ static unsigned int horizon_registry_init(void)
             return HORIZON_REG_NO_MEMORY;
         }
     }
-    /* The classes the staged DLLs serve, which on Windows are written by each
-     * DLL's own DllRegisterServer when it is installed. Nothing here installs
-     * anything, so they are written out beside the runtime instead and read
-     * before a program asks: a game that creates a filter graph or a text
-     * service gets one rather than a null pointer it does not check. Loaded
-     * before system.reg, so anything a program has written for itself since
-     * still wins. */
-    horizon_registry_load_hive( machine, "config/classes.reg" );
+    /* The classes the DLLs serve, which on Windows are written by each DLL's
+     * own DllRegisterServer when it is installed. Nothing here installs
+     * anything, so the DLL repository writes them out beside its manifest and
+     * they are read before a program asks: a game that creates a filter graph
+     * or a text service gets one rather than a null pointer it does not check.
+     * Loaded before system.reg, so anything a program has written for itself
+     * since still wins. */
+    horizon_registry_load_hive( machine, "horizon-dlls/classes.reg" );
     horizon_registry_move_hives( HORIZON_REGISTRY_DIR );
     horizon_registry_load_hive( machine, HORIZON_REGISTRY_SUBDIR "system.reg" );
     horizon_registry_load_hive( user, HORIZON_REGISTRY_SUBDIR "user.reg" );
@@ -326,6 +349,75 @@ static unsigned int horizon_registry_init(void)
     memset( horizon_registry_saved, 0, sizeof(horizon_registry_saved) );
     horizon_registry.changed = horizon_registry_changed;
     return 0;
+}
+
+static int horizon_registry_ascii( const char *text, unsigned short *wide, size_t capacity )
+{
+    size_t length = strlen( text );
+
+    if (length >= capacity) return 0;
+    for (size_t i = 0; i <= length; i++)
+    {
+        if ((unsigned char)text[i] > 127) return 0;
+        wide[i] = (unsigned char)text[i];
+    }
+    return 1;
+}
+
+/* Session overrides must not replace persisted launcher settings. */
+unsigned int horizon_registry_make_session_key( const char *path )
+{
+    unsigned short name[512];
+    struct horizon_reg_key *key = NULL, *session;
+    unsigned int status, index;
+
+    if (!path || !*path || *path == '\\' ||
+        !horizon_registry_ascii( path, name, sizeof(name) / sizeof(name[0]) ))
+        return HORIZON_REG_INVALID_PARAMETER;
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if ((status = horizon_registry_init())) goto done;
+    status = horizon_reg_open( &horizon_registry, horizon_registry_hives[1], name, strlen(path) * 2, 0, &key );
+    if (status == HORIZON_REG_NAME_NOT_FOUND)
+    {
+        session = horizon_reg_create_ascii( &horizon_registry, horizon_registry_hives[1], path );
+        status = session ? HORIZON_REG_SUCCESS : HORIZON_REG_NO_MEMORY;
+        if (session) session->flags |= HORIZON_REG_FLAG_VOLATILE;
+        goto done;
+    }
+    if (status || (key->flags & HORIZON_REG_FLAG_VOLATILE)) goto done;
+    if (horizon_registry_session_key || key->subkey_count || (key->flags & HORIZON_REG_FLAG_SYMLINK))
+    {
+        status = HORIZON_REG_INVALID_PARAMETER;
+        goto done;
+    }
+    if (!(session = horizon_reg_alloc_key( key->name, key->namelen, horizon_registry_now() )))
+    {
+        status = HORIZON_REG_NO_MEMORY;
+        goto done;
+    }
+    session->flags |= HORIZON_REG_FLAG_VOLATILE;
+    for (unsigned int i = 0; i < key->value_count; i++)
+    {
+        const struct horizon_reg_value *value = &key->values[i];
+        status = horizon_reg_set_value( &horizon_registry, session, value->name, value->namelen,
+                                        value->type, value->data, value->len );
+        if (status)
+        {
+            horizon_reg_release( &horizon_registry, session );
+            goto done;
+        }
+    }
+    horizon_reg_find_subkey( key->parent, key->name, key->namelen, &index );
+    session->parent = key->parent;
+    key->parent->subkeys[index] = session;
+    horizon_registry_session_key = session;
+    horizon_registry_session_saved = key;
+    session->refs++;
+    key->parent->refs++;
+done:
+    if (key) horizon_reg_release( &horizon_registry, key );
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return status;
 }
 
 /* The in-process server has a single local user and no impersonation tokens.

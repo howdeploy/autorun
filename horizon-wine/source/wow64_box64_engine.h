@@ -1,0 +1,29 @@
+/* Copyright 2026 Wine-NX contributors. LGPL-2.1-or-later. */
+#ifndef WINE_NX_WOW64_BOX64_ENGINE_H
+#define WINE_NX_WOW64_BOX64_ENGINE_H
+#include <stdint.h>
+#include "wow64_box64_bridge.h"
+
+/* Experimental interpreter entry. Guest pointers are identity mapped; the
+ * host exception handler must call wine_nx_box64_handle_fault for unresolved
+ * data aborts. Compiler read faults discard the translation and retry through
+ * the interpreter. A nonzero completion PC
+ * is for embedding/tests, not a guest-accessible native function pointer.
+ * Supports integer/segment/SSE transfer with default MXCSR; x87/AVX and
+ * nonempty x87 state are rejected explicitly. This is not a full CPU backend.
+ * With both dispatch callbacks NULL, returns success at a gate without changing
+ * its stack/EAX; the PE caller dispatches and invokes the engine again.
+ * Each invocation owns its emulator, allowing native callbacks to reenter. */
+NTSTATUS wine_nx_box64_run( I386_CONTEXT *context, ULONG fs_base,
+                          const struct wine_nx_wow64_gates *gates,
+                          const struct wine_nx_wow64_host *host, void *opaque,
+                          ULONG completion_pc, ULONGLONG budget, ULONGLONG *executed );
+
+/* Unresolved data aborts: recover guest state, or cancel speculative compilation.
+ * Called after libnx returns from the kernel exception. */
+BOOL wine_nx_box64_handle_fault( ULONG_PTR address, ULONG access, const ARM64_NT_CONTEXT *context );
+
+/* What the last STATUS_ACCESS_VIOLATION of this thread's run was about: the
+ * address, and 0 read, 1 write or 8 execute. */
+void wine_nx_box64_last_fault( ULONG *address, ULONG *access );
+#endif

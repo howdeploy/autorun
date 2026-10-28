@@ -48,7 +48,9 @@
 @ cdecl __AdjustPointer(ptr ptr)
 @ stub __BuildCatchObject
 @ stub __BuildCatchObjectHelper
-@ stdcall -arch=!i386 __C_specific_handler(ptr long ptr ptr)
+@ stdcall -arch=!i386,!arm64ec __C_specific_handler(ptr long ptr ptr)
+# ARM64EC callers need ntdll's native-frame exception handler.
+@ stdcall -arch=arm64ec -private __C_specific_handler(ptr long ptr ptr)
 @ cdecl __CxxDetectRethrow(ptr)
 @ cdecl __CxxExceptionFilter(ptr ptr long ptr)
 @ cdecl -norelay __CxxFrameHandler(ptr ptr ptr ptr)
@@ -1604,7 +1606,7 @@
 @ cdecl _o_erff(float) erff
 @ cdecl _o_erfl(double) erf
 @ cdecl _o_exit(long) exit
-@ cdecl _o_exp(double) exp
+@ cdecl _o_exp(double) MSVCRT_exp
 @ cdecl _o_exp2(double) exp2
 @ cdecl _o_exp2f(float) exp2f
 @ cdecl _o_exp2l(double) exp2
@@ -2043,7 +2045,7 @@
 @ cdecl _wcstof_l(wstr ptr ptr)
 @ cdecl -ret64 _wcstoi64(wstr ptr long)
 @ cdecl -ret64 _wcstoi64_l(wstr ptr long ptr)
-@ stub _wcstoimax_l
+@ cdecl -ret64 _wcstoimax_l(wstr ptr long ptr) _wcstoi64_l
 @ cdecl _wcstol_l(wstr ptr long ptr)
 @ cdecl _wcstold_l(wstr ptr ptr) _wcstod_l
 @ cdecl -ret64 _wcstoll_l(wstr ptr long ptr) _wcstoi64_l
@@ -2053,7 +2055,7 @@
 @ cdecl -ret64 _wcstoui64_l(wstr ptr long ptr)
 @ cdecl _wcstoul_l(wstr ptr long ptr)
 @ cdecl -ret64 _wcstoull_l(wstr ptr long ptr) _wcstoui64_l
-@ stub _wcstoumax_l
+@ cdecl -ret64 _wcstoumax_l(wstr ptr long ptr) _wcstoui64_l
 @ cdecl _wcsupr(wstr)
 @ cdecl _wcsupr_l(wstr ptr)
 @ cdecl _wcsupr_s(wstr long)
@@ -2275,7 +2277,7 @@
 @ cdecl erff(float)
 @ cdecl erfl(double) erf
 @ cdecl exit(long)
-@ cdecl exp(double)
+@ cdecl exp(double) MSVCRT_exp
 @ cdecl exp2(double)
 @ cdecl exp2f(float)
 @ cdecl exp2l(double) exp2
@@ -2582,7 +2584,7 @@
 @ cdecl wcsstr(wstr wstr)
 @ cdecl wcstod(wstr ptr)
 @ cdecl wcstof(ptr ptr)
-@ stub wcstoimax
+@ cdecl -ret64 wcstoimax(wstr ptr long) _wcstoi64
 @ cdecl wcstok(wstr wstr ptr)
 @ cdecl wcstok_s(ptr wstr ptr)
 @ cdecl wcstol(wstr ptr long)
@@ -2592,7 +2594,7 @@
 @ cdecl wcstombs_s(ptr ptr long wstr long)
 @ cdecl wcstoul(wstr ptr long)
 @ cdecl -ret64 wcstoull(wstr ptr long) _wcstoui64
-@ stub wcstoumax
+@ cdecl -ret64 wcstoumax(wstr ptr long) _wcstoui64
 @ cdecl wcsxfrm(ptr wstr long)
 @ cdecl wctob(long)
 @ cdecl wctomb(ptr long)

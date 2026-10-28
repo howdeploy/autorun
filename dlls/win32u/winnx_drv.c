@@ -3,7 +3,7 @@
  *
  * Windows render into ordinary DIB memory (handled by the GDI engine), and the
  * window surface's flush() copies the dirty pixels to the runtime's OpenGL
- * compositor, one layer per window surface (wine-nx-probe/source/compositor.c),
+ * compositor, one layer per window surface (horizon-wine/source/compositor.c),
  * or, with switch/wine/framebuffer.txt, straight to the libnx framebuffer via
  * the runtime hooks wine_nx_fb_*().
  *
@@ -30,25 +30,23 @@
 #include "ntuser_private.h"
 #include "win32u_private.h"
 #include "wine/gdi_driver.h"
-#include "../../wine-nx-probe/source/compositor.h"
+#include "../../horizon-wine/source/compositor.h"
+#include "../../horizon-wine/source/input_events.h"
 
-/* Framebuffer hooks implemented in the runtime (wine-nx-probe/source/runtime.c). */
+/* Framebuffer hooks implemented in the runtime (horizon-wine/source/runtime.c). */
 extern void *wine_nx_fb_lock( int *width, int *height, int *stride_px );
 extern void  wine_nx_fb_unlock( void );
 extern void  wine_nx_fb_present( void );
 extern int   wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons );
-extern int   wine_nx_pointer_take( int *x, int *y, unsigned int *buttons, unsigned int *pressed,
-                                   unsigned int *released );
+extern void  wine_nx_input_take( struct input_snapshot *out );
 extern void  wine_nx_pointer_set_pos( int x, int y );
 extern void  wine_nx_pointer_follow( int x, int y );
-extern int   wine_nx_pointer_take_motion( int *dx, int *dy );
-extern int   wine_nx_pointer_take_placed( void );
 extern void  wine_nx_cursor_show( int visible );
 extern void  wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
 extern int   wine_nx_runtime_verbose __attribute__((weak));
 /* Whether the runtime's OpenGL compositor presents the screen instead of the
  * framebuffer (starting it on the first call); each window surface then feeds
- * a layer of it (wine-nx-probe/source/compositor.h). */
+ * a layer of it (horizon-wine/source/compositor.h). */
 extern int   wine_nx_compositor_enabled( void );
 
 /* Buttons reported by wine_nx_pointer_poll(). */
@@ -370,7 +368,7 @@ static void wine_nx_note_surface_hidden( HWND hwnd )
 static BOOL wine_nx_present_hwnd_surface( HWND hwnd, const RECT *screen_rect )
 {
     struct window_surface *surface, *driver_surface;
-    UINT raw_dpi = 0;
+    struct ratio raw_dpi = {0};
     BOOL ret = FALSE;
 
     if (!(surface = window_surface_get( hwnd ))) return FALSE;
@@ -532,9 +530,10 @@ static void wine_nx_surface_destroy( struct window_surface *surface )
 
 static const struct window_surface_funcs wine_nx_surface_funcs =
 {
-    wine_nx_surface_set_clip,
-    wine_nx_surface_flush,
-    wine_nx_surface_destroy,
+    .size = sizeof(struct wine_nx_surface),
+    .set_clip = wine_nx_surface_set_clip,
+    .flush = wine_nx_surface_flush,
+    .destroy = wine_nx_surface_destroy,
 };
 
 /**********************************************************************
@@ -564,7 +563,7 @@ UINT wine_nx_drv_UpdateDisplayDevices( const struct gdi_device_manager *dm, void
     UINT dpi = NtUserGetSystemDpiForProcess( NULL );
     DEVMODEW current = mode;
 
-    dm->add_gpu( "Wine NX GPU", &pci_id, NULL, param );
+    dm->add_gpu( "Tegra X1 GM20B", &pci_id, NULL, param );
     dm->add_source( "Default", source_flags, dpi, param );
     dm->add_monitor( &monitor, param );
     current.dmFields |= DM_POSITION;
@@ -575,12 +574,6 @@ UINT wine_nx_drv_UpdateDisplayDevices( const struct gdi_device_manager *dm, void
 
 /**********************************************************************
  *           wine_nx_drv_ProcessEvents
- *
- * Expose the Switch pointer as an absolute mouse: the right analog stick
- * moves the cursor, A is the left button and B the right, and a touchscreen
- * contact acts as a left press under the finger.  This gives classic Win32
- * applications useful input immediately, including non-client hit testing,
- * menus and controls.
  */
 /* The button flags that take the delivered buttons (last) to the held ones,
  * in two steps: a button pressed and released since the last delivery clicks
@@ -592,6 +585,7 @@ static void wine_nx_pointer_flags( unsigned int last, unsigned int held, unsigne
     {
         { WINE_NX_POINTER_LEFT, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP },
         { WINE_NX_POINTER_RIGHT, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP },
+        { 4, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP },
     };
     unsigned int i;
 
@@ -614,42 +608,51 @@ static void wine_nx_pointer_flags( unsigned int last, unsigned int held, unsigne
     }
 }
 
-/* The controller stands in for the keyboard the console does not have. The
- * runtime polls it and keeps the held controls in wine_nx_pad_key_state, with
- * the virtual-key code of each in wine_nx_pad_keys (wine-nx-probe/source/
- * runtime.c, overridable through switch/wine/keys.txt and a program's own
- * NAME.keys.txt). */
-#define WINE_NX_PAD_KEY_COUNT 28
-extern unsigned int wine_nx_pad_key_state __attribute__((weak));
-extern unsigned short wine_nx_pad_keys[] __attribute__((weak));
-
-static BOOL wine_nx_send_keys(void)
+static void wine_nx_send_key( const struct input_key_event *event )
 {
-    static unsigned int delivered;
-    unsigned int held, changed, i;
+    INPUT input = {0};
+    UINT scan;
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = event->code == INPUT_NUMPAD_ENTER ? VK_RETURN : event->code;
+    input.ki.dwFlags = event->down ? 0 : KEYEVENTF_KEYUP;
+    scan = NtUserMapVirtualKeyEx( input.ki.wVk, MAPVK_VK_TO_VSC_EX, NtUserGetKeyboardLayout( 0 ) );
+    input.ki.wScan = scan & 0xff;
+    if ((scan & 0xff00) == 0xe000 || event->code == INPUT_NUMPAD_ENTER) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    NtUserSendHardwareInput( 0, 0, &input, 0 );
+}
 
-    if (!&wine_nx_pad_key_state || !wine_nx_pad_keys) return FALSE;
-    held = __atomic_load_n( &wine_nx_pad_key_state, __ATOMIC_RELAXED );
-    if (!(changed = held ^ delivered)) return FALSE;
-
-    for (i = 0; i < WINE_NX_PAD_KEY_COUNT; i++)
+static void wine_nx_send_extra_mouse( unsigned int last, unsigned int held, unsigned int pressed,
+                                      unsigned int released, int vertical, int horizontal )
+{
+    for (unsigned int i = 3; i < 5; i++)
     {
-        INPUT input = {0};
-        UINT scan;
-
-        if (!(changed & (1u << i)) || !wine_nx_pad_keys[i]) continue;
-        input.type = INPUT_KEYBOARD;
-        input.ki.wVk = wine_nx_pad_keys[i];
-        input.ki.dwFlags = (held & (1u << i)) ? 0 : KEYEVENTF_KEYUP;
-        /* DirectInput names keys by scan code, and an arrow is E0 48, not 48. */
-        scan = NtUserMapVirtualKeyEx( input.ki.wVk, MAPVK_VK_TO_VSC_EX, NtUserGetKeyboardLayout( 0 ) );
-        input.ki.wScan = scan & 0xff;
-        if ((scan & 0xff00) == 0xe000) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+        unsigned int bit = 1u << i;
+        int was = !!(last & bit), now = !!(held & bit);
+        INPUT input = { .type = INPUT_MOUSE };
+        input.mi.mouseData = i == 3 ? XBUTTON1 : XBUTTON2;
+        if (was ? (now && !(released & bit)) : !(now || (pressed & bit))) continue;
+        input.mi.dwFlags = was ? MOUSEEVENTF_XUP : MOUSEEVENTF_XDOWN;
+        NtUserSendHardwareInput( 0, 0, &input, 0 );
+        if (was == now)
+        {
+            input.mi.dwFlags = was ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP;
+            NtUserSendHardwareInput( 0, 0, &input, 0 );
+        }
+    }
+    if (vertical)
+    {
+        INPUT input = { .type = INPUT_MOUSE };
+        input.mi.dwFlags = MOUSEEVENTF_WHEEL;
+        input.mi.mouseData = vertical;
         NtUserSendHardwareInput( 0, 0, &input, 0 );
     }
-    nxdrv_trace( "[NXINPUT] keys held=%x changed=%x", held, changed, 0, 0 );
-    delivered = held;
-    return TRUE;
+    if (horizontal)
+    {
+        INPUT input = { .type = INPUT_MOUSE };
+        input.mi.dwFlags = MOUSEEVENTF_HWHEEL;
+        input.mi.mouseData = horizontal;
+        NtUserSendHardwareInput( 0, 0, &input, 0 );
+    }
 }
 
 /* A touch points at a place on the screen. */
@@ -678,6 +681,13 @@ static void wine_nx_send_mouse_motion( int dx, int dy )
     NtUserSendHardwareInput( 0, 0, &input, 0 );
 }
 
+static void wine_nx_flush_mouse(void)
+{
+    static const INPUT input = { .type = INPUT_MOUSE, .mi.dwFlags = MOUSEEVENTF_MOVE_NOCOALESCE };
+
+    NtUserSendHardwareInput( 0, 0, &input, 0 );
+}
+
 /* Where the cursor really is. NtUserGetCursorPos is not it: without a recent
  * change it asks the display driver, which is this one, and maps the answer
  * through the thread's DPI. The stick works in the screen's own coordinates,
@@ -696,7 +706,7 @@ static BOOL wine_nx_cursor_pos( POINT *pos )
     return !status;
 }
 
-/* One key, down or up, with a real scan code the way wine_nx_send_keys
+/* One key, down or up, with a real scan code the way wine_nx_send_key
  * derives it - so DirectInput's keyboard state buffer and GetAsyncKeyState
  * see it, not only whatever WM_CHAR a message loop's TranslateMessage makes
  * of it. */
@@ -713,7 +723,7 @@ static void wine_nx_send_vk( HKL layout, BYTE vk, BOOL up )
     NtUserSendHardwareInput( 0, 0, &input, 0 );
 }
 
-/* The floating keyboard (wine-nx-probe/source/osk.c) queues the keys pressed
+/* The floating keyboard (horizon-wine/source/osk.c) queues the keys pressed
  * on it, each due at its time; they go to whichever window has focus, as the
  * controller's do. */
 extern int wine_nx_osk_next_key( unsigned long long now_ns, unsigned short *vk, int *up ) __attribute__((weak));
@@ -771,6 +781,11 @@ static void wine_nx_update_cursor( void )
 
 BOOL wine_nx_drv_ProcessEvents( DWORD mask )
 {
+    static unsigned int delivering;
+    struct input_snapshot snapshot;
+    const struct input_key_event *key_events = snapshot.keys;
+    unsigned int key_count, key_after;
+    int wheel, hwheel;
     static unsigned int last_buttons;
     unsigned int buttons, pressed, released;
     DWORD first, second;
@@ -778,17 +793,35 @@ BOOL wine_nx_drv_ProcessEvents( DWORD mask )
     int x, y, dx, dy;
 
     (void)mask;
+    if (__atomic_exchange_n( &delivering, 1, __ATOMIC_ACQUIRE )) return FALSE;
     wine_nx_fb_present();
     /* Poll here too, then deliver everything the polls saw since the last
      * call, including those of the background thread. */
     wine_nx_pointer_poll( &x, &y, &buttons );
-    moved = wine_nx_pointer_take( &x, &y, &buttons, &pressed, &released );
-    placed = wine_nx_pointer_take_placed();
-    stepped = wine_nx_pointer_take_motion( &dx, &dy );
+    wine_nx_input_take( &snapshot );
+    x = snapshot.x;
+    y = snapshot.y;
+    dx = snapshot.dx;
+    dy = snapshot.dy;
+    buttons = snapshot.buttons;
+    pressed = snapshot.pressed;
+    released = snapshot.released;
+    moved = snapshot.moved;
+    placed = snapshot.placed;
+    stepped = dx || dy;
+    key_count = snapshot.key_count;
+    wheel = snapshot.wheel;
+    hwheel = snapshot.hwheel;
+    key_after = key_count;
+    while (key_after && !key_events[key_after - 1].down) key_after--;
+    for (unsigned int i = 0; i < key_after; i++) wine_nx_send_key( key_events + i );
     wine_nx_pointer_flags( last_buttons, buttons, pressed, released, &first, &second );
     if (placed || first) wine_nx_send_mouse( x, y, (placed ? MOUSEEVENTF_MOVE : 0) | first );
     if (stepped) wine_nx_send_mouse_motion( dx, dy );
     if (second) wine_nx_send_mouse( x, y, second );
+    wine_nx_flush_mouse();
+    wine_nx_send_extra_mouse( last_buttons, buttons, pressed, released, wheel, hwheel );
+    for (unsigned int i = key_after; i < key_count; i++) wine_nx_send_key( key_events + i );
     if (moved || placed || stepped)
     {
         POINT pos;
@@ -816,10 +849,11 @@ BOOL wine_nx_drv_ProcessEvents( DWORD mask )
     if (first) nxdrv_trace( "[NXINPUT] buttons=%x flags=%x,%x x=%d", buttons, first, second, x );
     else if (moved) nxdrv_trace_hot( "[NXINPUT] move x=%d y=%d buttons=%x", x, y, buttons, 0 );
     last_buttons = buttons;
-    keys = wine_nx_send_keys();
+    keys = key_count || wheel || hwheel || ((pressed | released) & 0x1c);
     keys |= wine_nx_send_keyboard_keys();
     wine_nx_update_cursor();
     wine_nx_fb_present();
+    __atomic_store_n( &delivering, 0, __ATOMIC_RELEASE );
     return moved || first || keys;
 }
 
@@ -891,7 +925,7 @@ BOOL wine_nx_drv_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surfa
     info->bmiHeader.biSizeImage   = get_dib_image_size( info );
     info->bmiHeader.biCompression = BI_RGB;
 
-    *surface = window_surface_create( sizeof(struct wine_nx_surface), &wine_nx_surface_funcs,
+    *surface = window_surface_create( &wine_nx_surface_funcs,
                                       hwnd, surface_rect, info, 0 );
     /* Made with the surface, the layer gets every flush of it. win32u fills a
      * new surface with white: a window that never paints with GDI, like a

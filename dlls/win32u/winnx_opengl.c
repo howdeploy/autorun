@@ -17,7 +17,6 @@
 
 #ifdef __SWITCH__
 
-#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,12 +27,12 @@
 #include "win32u_private.h"
 #include "wine/opengl_driver.h"
 #include "wine/debug.h"
-#include "../../wine-nx-probe/source/osk.h"
+#include "../../horizon-wine/source/osk.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(wgl);
 
 /* The runtime hands the screen's NWindow to one OpenGL surface at a time
- * (wine-nx-probe/source/runtime.c). */
+ * (horizon-wine/source/runtime.c). */
 extern void *wine_nx_gl_acquire_window( void );
 extern void wine_nx_gl_release_window( void );
 extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
@@ -41,14 +40,63 @@ extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
 static const struct egl_platform *egl;
 static const struct opengl_funcs *funcs;
 static const struct opengl_drawable_funcs nx_drawable_funcs;
-static const struct opengl_drawable_funcs nx_offscreen_funcs;
 
 struct nx_gl_drawable
 {
     struct opengl_drawable base;
     BOOL screen;  /* this drawable shares the screen's EGL surface */
-    BOOL deferred;  /* no surface yet: the screen is taken on the first swap */
+    LONG generation;
 };
+
+struct nx_client_surface
+{
+    struct client_surface base;
+    SIZE size;
+    LONG generation;
+};
+
+static void nx_client_surface_destroy( struct client_surface *client )
+{
+}
+
+static void nx_client_surface_update( struct client_surface *client )
+{
+    struct nx_client_surface *surface = CONTAINING_RECORD( client, struct nx_client_surface, base );
+    const RECT *rect = client->raw ? &client->monitor_rect : &client->virtual_rect;
+    SIZE size;
+    BOOL offscreen, changed;
+
+    if (!client->format) return; /* Vulkan clients have no WGL pixel format. */
+    size = (SIZE){ max( 1, rect->right - rect->left ), max( 1, rect->bottom - rect->top ) };
+    offscreen = !(get_window_long( client->hwnd, GWL_STYLE ) & WS_VISIBLE);
+    if (!offscreen && client->hwnd != client->toplevel) offscreen = !is_window_visible( client->hwnd );
+    changed = InterlockedExchange( &client->offscreen, offscreen ) != offscreen;
+
+    if (changed || (offscreen && (size.cx != surface->size.cx || size.cy != surface->size.cy)))
+        InterlockedIncrement( &surface->generation );
+    surface->size = size;
+}
+
+static void nx_client_surface_present( struct client_surface *client, HDC hdc )
+{
+}
+
+static const struct client_surface_funcs nx_client_surface_funcs =
+{
+    .size = sizeof(struct nx_client_surface),
+    .destroy = nx_client_surface_destroy,
+    .detach = nx_client_surface_destroy,
+    .update = nx_client_surface_update,
+    .present = nx_client_surface_present,
+};
+
+struct client_surface *wine_nx_drv_CreateClientSurface( HWND hwnd, int format, BOOL raw )
+{
+    struct client_surface *client = client_surface_create( &nx_client_surface_funcs, hwnd, format, raw );
+
+    if (client) nx_client_surface_update( client );
+    return client;
+}
 
 /* The one EGL surface on the screen's NWindow, and the drawables sharing it.
  * win32u gives a window a second drawable whenever another context is made
@@ -63,6 +111,17 @@ static int nx_screen_format;
 static struct nx_gl_drawable *impl_from_opengl_drawable( struct opengl_drawable *base )
 {
     return CONTAINING_RECORD( base, struct nx_gl_drawable, base );
+}
+
+BOOL wine_nx_gl_drawable_matches_window( struct opengl_drawable *base )
+{
+    struct nx_client_surface *client;
+
+    if (base->funcs != &nx_drawable_funcs) return TRUE;
+    if (!base->client || base->client->funcs != &nx_client_surface_funcs) return TRUE;
+    client = CONTAINING_RECORD( base->client, struct nx_client_surface, base );
+    return impl_from_opengl_drawable( base )->generation ==
+           InterlockedCompareExchange( &client->generation, 0, 0 );
 }
 
 static void nx_log( const char *format, ... )
@@ -116,18 +175,16 @@ static void nx_drawable_flush( struct opengl_drawable *base, UINT flags )
 {
     TRACE( "drawable %s, flags %#x\n", debugstr_opengl_drawable( base ), flags );
 
-    /* A deferred drawable takes its interval when it gets the screen. */
-    if ((flags & GL_FLUSH_INTERVAL) && base->surface)
+    if (impl_from_opengl_drawable( base )->screen && (flags & GL_FLUSH_INTERVAL))
         funcs->p_eglSwapInterval( egl->display, abs( base->interval ) );
 }
 
 /* Frames presented and the time inside eglSwapBuffers, for [PROGRESS]. */
 extern unsigned long long horizon_interrupt_time(void);
 unsigned int wine_nx_gl_swaps;
-unsigned int wine_nx_gl_swap_attempts, wine_nx_gl_swap_failures;
 unsigned long long wine_nx_gl_swap_time;  /* 100 ns */
 
-/* The floating keyboard (wine-nx-probe/source/osk.c), put into the back
+/* The floating keyboard (horizon-wine/source/osk.c), put into the back
  * buffer just before it is shown: its picture in a texture of each context's
  * own, blitted from a framebuffer of its own onto the window's. Everything
  * the blit and the upload depend on is put back as the program left it. */
@@ -252,150 +309,75 @@ static void nx_osk_draw( struct opengl_drawable *base )
     funcs->p_glPixelStorei( GL_UNPACK_ALIGNMENT, alignment );
 }
 
-static BOOL nx_drawable_take_screen( struct nx_gl_drawable *gl );
-
 static BOOL nx_drawable_swap( struct opengl_drawable *base )
 {
-    struct nx_gl_drawable *gl = impl_from_opengl_drawable( base );
     unsigned long long start;
-    unsigned int attempt;
     BOOL ret;
 
-    attempt = __atomic_add_fetch( &wine_nx_gl_swap_attempts, 1, __ATOMIC_RELAXED );
-    if (attempt <= 4)
-        nx_log( "[NXGL] swap begin attempt=%u hwnd=%p format=%d doublebuffer=%u",
-                attempt, base->client ? base->client->hwnd : NULL, base->format, base->doublebuffer );
-    if (gl->deferred)
-    {
-        EGLContext context = funcs->p_eglGetCurrentContext();
-
-        /* The window presents for the first time: only now does it get the
-         * screen. Its context was current without a surface until here, so
-         * this frame's drawing is lost; the next ones reach the screen. */
-        if (!nx_drawable_take_screen( gl ))
-        {
-            unsigned int failures = __atomic_add_fetch( &wine_nx_gl_swap_failures, 1, __ATOMIC_RELAXED );
-            if (!(failures & (failures - 1)))
-                nx_log( "[NXGL] swap failed attempt=%u failures=%u: no screen surface", attempt, failures );
-            return FALSE;
-        }
-        if (context && funcs->p_eglGetCurrentSurface( EGL_DRAW ) == EGL_NO_SURFACE)
-            funcs->p_eglMakeCurrent( egl->display, base->surface, base->surface, context );
-        if (base->interval != INT_MIN) funcs->p_eglSwapInterval( egl->display, abs( base->interval ) );
-    }
+    if (!impl_from_opengl_drawable( base )->screen)
+        return funcs->p_eglSwapBuffers( egl->display, base->surface );
     nx_osk_draw( base );
     start = horizon_interrupt_time();
     ret = funcs->p_eglSwapBuffers( egl->display, base->surface );
     __atomic_add_fetch( &wine_nx_gl_swap_time, horizon_interrupt_time() - start, __ATOMIC_RELAXED );
-    if (ret) __atomic_add_fetch( &wine_nx_gl_swaps, 1, __ATOMIC_RELAXED );
-    else
-    {
-        unsigned int failures = __atomic_add_fetch( &wine_nx_gl_swap_failures, 1, __ATOMIC_RELAXED );
-        EGLint error = funcs->p_eglGetError();
-        if (!(failures & (failures - 1)))
-            nx_log( "[NXGL] swap failed attempt=%u failures=%u error=%#x", attempt, failures, error );
-    }
-    if (attempt <= 4) nx_log( "[NXGL] swap return attempt=%u success=%u", attempt, ret );
+    __atomic_add_fetch( &wine_nx_gl_swaps, 1, __ATOMIC_RELAXED );
     return ret;
 }
 
 static const struct opengl_drawable_funcs nx_drawable_funcs =
 {
+    .size = sizeof(struct nx_gl_drawable),
     .destroy = nx_drawable_destroy,
     .flush = nx_drawable_flush,
     .swap = nx_drawable_swap,
 };
 
-/* WineD3D's caps/backup windows and ddraw's hidden device window are never
- * display targets. Keep their FBOs offscreen so GDI can still be composed. */
-static BOOL nx_auxiliary_window( HWND hwnd, LONG style, char *class_name, size_t size )
+/* Visible OpenGL windows share the screen; hidden windows render offscreen. */
+static BOOL nx_surface_create( struct client_surface *client, int format, struct opengl_drawable **drawable )
 {
-    static const WCHAR wined3d[] = {'W','i','n','e','D','3','D','_','O','p','e','n','G','L'};
-    static const WCHAR ddraw[] = {'D','i','r','e','c','t','D','r','a','w','D','e','v','i','c','e','W','n','d'};
-    WCHAR buffer[64];
-    UNICODE_STRING name = {0, sizeof(buffer), buffer};
-    int count = NtUserGetClassName( hwnd, FALSE, &name );
-    size_t i;
-
-    if (count < 0) count = 0;
-    for (i = 0; i < (size_t)count && i + 1 < size; i++)
-        class_name[i] = buffer[i] < 128 ? buffer[i] : '?';
-    class_name[i] = 0;
-    if (style & WS_VISIBLE) return FALSE;
-    return ((size_t)count * sizeof(WCHAR) == sizeof(wined3d) && !memcmp( buffer, wined3d, sizeof(wined3d) )) ||
-           ((style & WS_DISABLED) && (size_t)count * sizeof(WCHAR) == sizeof(ddraw) &&
-            !memcmp( buffer, ddraw, sizeof(ddraw) ));
-}
-
-/* An auxiliary window's drawable: a pbuffer of its client size, never shown.
- * win32u makes the drawable itself current (raw 0 has no framebuffer wrapper),
- * so it needs an EGL surface of its own; without one the context is made
- * current surfaceless, which switch-mesa's EGL_KHR_surfaceless_context allows. */
-static void nx_offscreen_destroy( struct opengl_drawable *base )
-{
-    /* win32u destroys the pbuffer after this callback. */
-}
-
-static void nx_offscreen_flush( struct opengl_drawable *base, UINT flags )
-{
-}
-
-static BOOL nx_offscreen_swap( struct opengl_drawable *base )
-{
-    return TRUE;
-}
-
-static const struct opengl_drawable_funcs nx_offscreen_funcs =
-{
-    .destroy = nx_offscreen_destroy,
-    .flush = nx_offscreen_flush,
-    .swap = nx_offscreen_swap,
-};
-
-static BOOL nx_offscreen_surface_create( HWND hwnd, int format, struct opengl_drawable **drawable )
-{
-    struct client_surface *client;
-    struct opengl_drawable *gl;
-    EGLint attribs[5];
-    RECT rect;
-    int width = 1, height = 1;
-
-    if (get_client_rect( hwnd, &rect, 0 ))
-    {
-        width = min( max( rect.right - rect.left, 1 ), 4096 );
-        height = min( max( rect.bottom - rect.top, 1 ), 4096 );
-    }
-    attribs[0] = EGL_WIDTH;
-    attribs[1] = width;
-    attribs[2] = EGL_HEIGHT;
-    attribs[3] = height;
-    attribs[4] = EGL_NONE;
-
-    if (!(client = nulldrv_client_surface_create( hwnd ))) return FALSE;
-    gl = opengl_drawable_create( sizeof(*gl), &nx_offscreen_funcs, format, client );
-    client_surface_release( client );
-    if (!gl) return FALSE;
-    gl->buffer_map[0] = GL_BACK_LEFT;
-    gl->buffer_map[1] = GL_BACK_RIGHT;
-    gl->buffer_map[GL_FRONT - GL_FRONT_LEFT] = GL_BACK;
-    gl->buffer_map[GL_FRONT_AND_BACK - GL_FRONT_LEFT] = GL_BACK;
-
-    gl->surface = funcs->p_eglCreatePbufferSurface( egl->display, nx_config_for_format( format ), attribs );
-    nx_log( "[NXGL] offscreen hwnd=%p %dx%d %s", hwnd, width, height,
-            gl->surface ? "pbuffer" : "surfaceless (pbuffer failed)" );
-    *drawable = gl;
-    return TRUE;
-}
-
-/* The screen for a window drawable: the surface another drawable of the window
- * already put on it, or a new one. The Switch has one NWindow, and window
- * surfaces and the compositor cannot share it, so the compositor gives it up
- * for as long as the surface exists. */
-static BOOL nx_drawable_take_screen( struct nx_gl_drawable *gl )
-{
-    HWND hwnd = gl->base.client ? gl->base.client->hwnd : NULL;
-    int format = gl->base.format;
+    HWND hwnd = client->hwnd;
+    struct opengl_drawable *previous;
+    struct nx_gl_drawable *gl;
+    struct nx_client_surface *nx_client = CONTAINING_RECORD( client, struct nx_client_surface, base );
+    LONG generation = client->funcs == &nx_client_surface_funcs ?
+                      InterlockedCompareExchange( &nx_client->generation, 0, 0 ) : 0;
     void *window;
+
+    TRACE( "hwnd %p, format %d\n", hwnd, format );
+
+    if ((previous = *drawable) && previous->format == format && wine_nx_gl_drawable_matches_window( previous ))
+        return TRUE;
+    /* A previous surface may hold the screen: let it go first. */
+    if (previous)
+    {
+        opengl_drawable_release( previous );
+        *drawable = NULL;
+    }
+
+    gl = opengl_drawable_create( &nx_drawable_funcs, format, client, NULL );
+    if (!gl) return FALSE;
+    gl->generation = generation;
+    gl->base.buffer_map[0] = GL_BACK_LEFT;
+    gl->base.buffer_map[1] = GL_BACK_RIGHT;
+    gl->base.buffer_map[GL_FRONT - GL_FRONT_LEFT] = GL_BACK;
+    gl->base.buffer_map[GL_FRONT_AND_BACK - GL_FRONT_LEFT] = GL_BACK;
+
+    if (InterlockedCompareExchange( &client->offscreen, 0, 0 ))
+    {
+        /* Capability probes must not take the screen away from Vulkan. */
+        SIZE size = client->raw ? gl->base.monitor_size : gl->base.virtual_size;
+        const EGLint attribs[] = { EGL_WIDTH, size.cx, EGL_HEIGHT, size.cy, EGL_NONE };
+
+        if (!(gl->base.surface = funcs->p_eglCreatePbufferSurface( egl->display, nx_config_for_format( format ), attribs )))
+        {
+            ERR( "hwnd %p: eglCreatePbufferSurface failed, error %#x\n", hwnd, funcs->p_eglGetError() );
+            goto err;
+        }
+        TRACE( "hwnd %p: offscreen surface %p, size %s\n", hwnd, gl->base.surface,
+               wine_dbgstr_point( (POINT *)&size ) );
+        *drawable = &gl->base;
+        return TRUE;
+    }
 
     pthread_mutex_lock( &nx_screen_mutex );
     if (nx_screen_surface && nx_screen_format == format)
@@ -403,10 +385,10 @@ static BOOL nx_drawable_take_screen( struct nx_gl_drawable *gl )
         /* Another drawable of this window still has the screen; share it. */
         gl->base.surface = nx_screen_surface;
         gl->screen = TRUE;
-        gl->deferred = FALSE;
         nx_screen_refs++;
         pthread_mutex_unlock( &nx_screen_mutex );
         TRACE( "hwnd %p: sharing the screen surface %p\n", hwnd, nx_screen_surface );
+        *drawable = &gl->base;
         return TRUE;
     }
     if (nx_screen_surface)
@@ -414,25 +396,25 @@ static BOOL nx_drawable_take_screen( struct nx_gl_drawable *gl )
         pthread_mutex_unlock( &nx_screen_mutex );
         ERR( "hwnd %p: the screen has a format %d surface, cannot serve format %d\n",
              hwnd, nx_screen_format, format );
-        return FALSE;
+        goto err;
     }
     pthread_mutex_unlock( &nx_screen_mutex );
 
     if (!(window = wine_nx_gl_acquire_window()))
     {
         ERR( "hwnd %p: the screen already has an OpenGL surface\n", hwnd );
-        return FALSE;
+        goto err;
     }
+    gl->screen = TRUE;
     if (!(gl->base.surface = funcs->p_eglCreateWindowSurface( egl->display, nx_config_for_format( format ),
                                                               (EGLNativeWindowType)window, NULL )))
     {
         ERR( "hwnd %p: eglCreateWindowSurface failed, error %#x\n", hwnd, funcs->p_eglGetError() );
         /* nothing is sharing the screen yet, so give it back here */
+        gl->screen = FALSE;
         wine_nx_gl_release_window();
-        return FALSE;
+        goto err;
     }
-    gl->screen = TRUE;
-    gl->deferred = FALSE;
 
     pthread_mutex_lock( &nx_screen_mutex );
     nx_screen_surface = gl->base.surface;
@@ -446,57 +428,17 @@ static BOOL nx_drawable_take_screen( struct nx_gl_drawable *gl )
         const char *vendor = funcs->p_eglQueryString( egl->display, EGL_VENDOR );
         const char *version = funcs->p_eglQueryString( egl->display, EGL_VERSION );
 
-        if (!logged) nx_log( "[NXGL] EGL %s %s, %u configs; window surface for format %d, hwnd=%p doublebuffer=%u",
-                             vendor ? vendor : "?", version ? version : "?", egl->config_count, format,
-                             hwnd, gl->base.doublebuffer );
+        /* raw 0: win32u draws through its framebuffer surface (DPI scaling or gamma) */
+        if (!logged) nx_log( "[NXGL] EGL %s %s, %u configs; window surface for format %d, raw %u",
+                             vendor ? vendor : "?", version ? version : "?", egl->config_count, format, client->raw );
         logged = TRUE;
     }
-    return TRUE;
-}
-
-/* A window drawable shares a screen surface the window already has, and
- * otherwise waits for its first swap to take the screen: Direct3D creates
- * contexts on windows it never presents to (RGSS keeps drawing them with GDI
- * through ddraw), and those must leave the compositor showing them. */
-static BOOL nx_surface_create( HWND hwnd, BOOL raw, int format, struct opengl_drawable **drawable )
-{
-    struct opengl_drawable *previous;
-    struct client_surface *client;
-    struct nx_gl_drawable *gl;
-    char class_name[64];
-    LONG style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
-    BOOL offscreen = nx_auxiliary_window( hwnd, style, class_name, sizeof(class_name) );
-
-    TRACE( "hwnd %p, raw %u, format %d\n", hwnd, raw, format );
-    nx_log( "[NXGL] surface hwnd=%p class=%s visible=%u style=%#lx format=%d raw=%u route=%s",
-            hwnd, class_name, !!(style & WS_VISIBLE), (unsigned long)style, format, raw,
-            offscreen ? "offscreen" : "screen on first swap" );
-
-    if ((previous = *drawable) && previous->format == format) return TRUE;
-    /* A previous surface may hold the screen: let it go first. */
-    if (previous)
-    {
-        opengl_drawable_release( previous );
-        *drawable = NULL;
-    }
-
-    if (offscreen) return nx_offscreen_surface_create( hwnd, format, drawable );
-
-    if (!(client = nulldrv_client_surface_create( hwnd ))) return FALSE;
-    gl = opengl_drawable_create( sizeof(*gl), &nx_drawable_funcs, format, client );
-    client_surface_release( client );
-    if (!gl) return FALSE;
-    gl->base.buffer_map[0] = GL_BACK_LEFT;
-    gl->base.buffer_map[1] = GL_BACK_RIGHT;
-    gl->base.buffer_map[GL_FRONT - GL_FRONT_LEFT] = GL_BACK;
-    gl->base.buffer_map[GL_FRONT_AND_BACK - GL_FRONT_LEFT] = GL_BACK;
-
-    pthread_mutex_lock( &nx_screen_mutex );
-    gl->deferred = !(nx_screen_surface && nx_screen_format == format);
-    pthread_mutex_unlock( &nx_screen_mutex );
-    if (!gl->deferred && !nx_drawable_take_screen( gl )) gl->deferred = TRUE;
     *drawable = &gl->base;
     return TRUE;
+
+err:
+    opengl_drawable_release( &gl->base );
+    return FALSE;
 }
 
 /* win32u's egldrv creates contexts without a config, but switch-mesa 20.1's EGL
@@ -504,9 +446,11 @@ static BOOL nx_surface_create( HWND hwnd, BOOL raw, int format, struct opengl_dr
  * EGL_BAD_CONFIG) and EGL_KHR_create_context_no_error. A context gets the config
  * of its pixel format, the one this format's window surfaces and pbuffers use,
  * so EGL lets them be made current together. */
-static BOOL nx_context_create( int format, void *share, const int *attribs, void **context )
+static struct opengl_context *nx_context_create( int format, struct opengl_context *share,
+                                                  const int *attribs, BOOL *shared )
 {
     EGLint egl_attribs[16], *end = egl_attribs, error;
+    struct opengl_context *context;
 
     TRACE( "format %d, share %p, attribs %p\n", format, share, attribs );
 
@@ -529,7 +473,7 @@ static BOOL nx_context_create( int format, void *share, const int *attribs, void
             if (attribs[1] & WGL_CONTEXT_ES2_PROFILE_BIT_EXT)
             {
                 ERR( "OpenGL ES contexts are not supported\n" );
-                return FALSE;
+                return NULL;
             }
             name = EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR;
             break;
@@ -553,16 +497,19 @@ static BOOL nx_context_create( int format, void *share, const int *attribs, void
     }
     *end = EGL_NONE;
 
+    if (!(context = calloc( 1, sizeof(*context) ))) return NULL;
     funcs->p_eglBindAPI( EGL_OPENGL_API );
-    *context = funcs->p_eglCreateContext( egl->display, nx_config_for_format( format ), share,
-                                          end != egl_attribs ? egl_attribs : NULL );
-    if ((error = funcs->p_eglGetError()) != EGL_SUCCESS || !*context)
+    context->host_context = funcs->p_eglCreateContext( egl->display, nx_config_for_format( format ),
+                                                        share ? share->host_context : NULL,
+                                                        end != egl_attribs ? egl_attribs : NULL );
+    if ((error = funcs->p_eglGetError()) != EGL_SUCCESS || !context->host_context)
     {
         ERR( "context creation failed for format %d, share %p, error %#x\n", format, share, error );
-        return FALSE;
+        free( context );
+        return NULL;
     }
-    TRACE( "created context %p\n", *context );
-    return TRUE;
+    TRACE( "created context %p\n", context );
+    return context;
 }
 
 /* Mesa's Switch platform is the default display; its windows are NWindows. */
@@ -594,12 +541,14 @@ UINT wine_nx_drv_OpenGLInit( UINT version, const struct opengl_funcs *opengl_fun
     nx_driver_funcs.p_get_proc_address = (*driver_funcs)->p_get_proc_address;
     nx_driver_funcs.p_init_pixel_formats = (*driver_funcs)->p_init_pixel_formats;
     nx_driver_funcs.p_describe_pixel_format = (*driver_funcs)->p_describe_pixel_format;
-    nx_driver_funcs.p_init_wgl_extensions = (*driver_funcs)->p_init_wgl_extensions;
+    nx_driver_funcs.p_init_extensions = (*driver_funcs)->p_init_extensions;
     nx_driver_funcs.p_context_destroy = (*driver_funcs)->p_context_destroy;
-    nx_driver_funcs.p_make_current = (*driver_funcs)->p_make_current;
+    nx_driver_funcs.p_context_activate = (*driver_funcs)->p_context_activate;
     nx_driver_funcs.p_pbuffer_create = (*driver_funcs)->p_pbuffer_create;
     nx_driver_funcs.p_pbuffer_updated = (*driver_funcs)->p_pbuffer_updated;
     nx_driver_funcs.p_pbuffer_bind = (*driver_funcs)->p_pbuffer_bind;
+    nx_driver_funcs.p_null_surface_create = (*driver_funcs)->p_null_surface_create;
+    nx_driver_funcs.p_cleanup_thread = (*driver_funcs)->p_cleanup_thread;
 
     *driver_funcs = &nx_driver_funcs;
     return STATUS_SUCCESS;

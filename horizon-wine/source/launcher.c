@@ -1,0 +1,4529 @@
+/*
+ * The runtime's launcher, shown before Wine starts: the Windows programs on
+ * the SD card as a grid of their icons, drawn with SDL2 (launcher_ui.c).
+ *
+ * - The library lists the programs within two folders of drive_c, plus those
+ *   added from the file browser (launcher-library.txt), sorted by title.
+ * - A program's menu (Y) changes its title, arguments and settings, which go
+ *   next to it (launcher_settings.h) and apply whenever it is started.
+ * - Settings (X) holds the launcher's look (launcher.txt) and the global
+ *   verbose.txt, profile.txt and framebuffer.txt.
+ * - The file browser adds a program from the SD card or a mounted USB volume:
+ *   C: is drive_c, Z: the card's root and D: through H: are USB volumes.
+ *
+ * Icons are read and decoded on a worker thread and shown as they arrive.
+ * When SDL cannot start, the text menu of launcher_console.c is shown instead.
+ */
+#include <dirent.h>
+#include <errno.h>
+#include <math.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/stat.h>
+
+#ifdef __SWITCH__
+#include <switch.h>
+#endif
+
+#include "launcher.h"
+#ifdef WINE_NX_HAS_EMBEDDED_LOGO
+#include "forwarder.h"
+#endif
+#include "launcher_catalog.h"
+#include "launcher_icons.h"
+#include "launcher_list.h"
+#include "launcher_pe.h"
+#include "launcher_input.h"
+#include "launcher_settings.h"
+#include "launcher_ui.h"
+#include "launcher_forwarder.h"
+#include "launcher_image.h"
+#include "launcher_artwork.h"
+#include "launcher_update.h"
+#include "launcher_dlls.h"
+#include "launcher_fixes.h"
+#include "launcher_setup.h"
+#include "setup_boot.h"
+#include "launcher_graphics.h"
+#include "launcher_dxvk.h"
+#include "launcher_game_settings.h"
+#include "autorun_install.h"
+#include "steamgriddb.h"
+#include "dxvk_releases.h"
+#include "box64_options.h"
+#include "launcher_i18n.h"
+#include "diagnostics.h"
+#include "ftp_server.h"
+#define snprintf launcher_snprintf
+#include "fex_options.h"
+#ifdef WINE_NX_SWAP_POC
+#include "launcher_swap.h"
+#include "swap_store.h"
+#endif
+
+#define ICON_SIDE      128    /* icons are decoded no larger than this */
+/* What decoded art may hold, in bytes of texture: every cover of a library
+ * and Home's art stay once they have been shown, so going back to a screen or
+ * a page shows them at once rather than decoding them again. Autorun runs as
+ * an application, with the memory of one. */
+#define ICON_BUDGET    (192ull * 1024 * 1024)
+/* How long art takes to come in, rather than appear at once. */
+#define ART_FADE_MS    160
+/* Decoded art made into textures per frame, as tico does on the Switch. */
+#define ICON_UPLOADS   3
+#define ICON_JOBS      64
+#define MAX_FILES      1024
+#define FOOTER_SPACE   38
+
+/* Home and Library's header, laid out after GameHub's at 1280x720. */
+enum shell_tab { SHELL_HOME, SHELL_LIBRARY, SHELL_SETTINGS, SHELL_TABS };
+#define SHELL_Y        UI_HEADER_CENTRE
+#define SHELL_ICON     30
+#define SHELL_MARGIN   UI_HEADER_MARGIN   /* which Home's content keeps too */
+#define SHELL_GAP      44
+/* What the header's pill keeps between its outline and the item inside it. */
+#define SHELL_PADDING  22
+
+/* Home: the games that have been played, most recent first, as 2:3 covers. The
+ * focused one is larger and never moves; the row slides through it, so choosing
+ * the next cover pushes the one before it off the left edge. */
+#define HOME_TOP          126
+#define HOME_FOCUS_W      240
+#define HOME_FOCUS_H      360
+#define HOME_CARD_W       200
+#define HOME_CARD_H       300
+#define HOME_FOCUS_GAP    16
+#define HOME_CARD_GAP     18
+#define HOME_RADIUS       26
+#define HOME_TITLE_Y      440
+#define HOME_HINT_Y       (720 - 50)
+#define BACKDROP_FADE_MS  280
+
+/* Where the D-pad and stick are: the header or the games. */
+enum zone { ZONE_HEADER, ZONE_CONTENT };
+
+/* The icons drawn from assets/ (launcher_icons.h), made once at the size they are shown. */
+enum symbol { SYMBOL_HOME, SYMBOL_LIBRARY, SYMBOL_ADD, SYMBOL_SETTINGS, SYMBOL_COUNT };
+
+enum icon_state { ICON_UNKNOWN, ICON_QUEUED, ICON_READY, ICON_MISSING };
+enum art_kind { ART_PORTRAIT, ART_SQUARE, ART_HERO };
+
+struct program
+{
+    char path[512];                    /* sdmc:/... */
+    char dos[256];                     /* C:\... or Z:\... */
+    char title[128];                   /* shown: its own title, the resources' or the file name */
+    char resource_title[128];
+    unsigned short machine;
+    struct launcher_settings settings;
+    int own_files;                     /* settings, arguments, controls or Box64 options beside it */
+    int added;                         /* listed in launcher-library.txt */
+    unsigned int catalog_id;
+    unsigned int added_order;
+    unsigned int launched_order;
+    int favorite;
+    int missing;
+    char square_art[512];
+    char portrait_art[512];
+    char hero_art[512];
+    int removed;
+    enum icon_state icon_state;
+    SDL_Texture *icon;
+    int icon_width, icon_height;
+    int icon_is_art;
+    Uint32 icon_time;
+    unsigned int icon_use, square_use, hero_use;   /* when each was last asked for */
+    enum icon_state square_state, hero_state;
+    SDL_Texture *square_icon, *hero_icon;
+    int square_width, square_height, hero_width, hero_height;
+    Uint32 square_time, hero_time;
+    unsigned int art_generation[3];
+};
+
+struct icon_job
+{
+    int index;
+    int kind;
+    unsigned int generation;
+    char path[512];
+    char artwork[512];
+};
+
+struct icon_result
+{
+    int index;
+    int kind;
+    unsigned int generation;
+    int width, height;
+    unsigned char *rgba;
+    int artwork;
+};
+
+struct file_entry
+{
+    char name[256];
+    int is_dir;
+    int supported;
+    unsigned short machine;
+};
+
+struct launcher
+{
+    struct wine_nx_launcher_options *options;
+    struct ui ui;
+    struct launcher_update *update;
+    struct launcher_dlls *dlls;
+    struct launcher_fixes *fixes;
+    /* The game fixes index got newer: say so once nothing modal is up. */
+    int fixes_notice;
+    struct launcher_graphics *graphics;
+
+    struct program programs[LAUNCHER_MAX_ENTRIES];
+    int program_count;
+    int visible[LAUNCHER_MAX_ENTRIES];
+    int visible_count;
+    int selection;
+    struct launcher_catalog catalog;
+    char search[128];
+    int favorites_only;
+    int sort_order;
+    float carousel_position;
+    int carousel_started;
+    Uint32 carousel_tick;
+    SDL_Rect carousel_hits[LAUNCHER_MAX_ENTRIES];
+    SDL_Texture *symbols[SYMBOL_COUNT];
+    /* The mark in the corner of the shell, from assets/logo.png. */
+    SDL_Texture *logo;
+    /* Home's own list: the programs that have been started, most recent first. */
+    int history[LAUNCHER_MAX_ENTRIES];
+    int history_count, history_selection;
+    /* What the D-pad moves, and which header item it is on. */
+    int zone, header_focus;
+    /* Where the header's pill stands and how wide it is, eased toward the item
+     * in focus so it slides between them instead of jumping. */
+    float pill_x, pill_w;
+    /* How much of each header item's name is out, eased toward 1 for the view
+     * being shown and 0 for the rest, so one name closes as the other opens. */
+    float label_open[SHELL_TABS];
+    /* Where the last frame drew what a tap can hit. */
+    SDL_Rect shell_hits[SHELL_TABS], add_hit;
+    /* The programs whose artwork is behind Home, fading from the previous one; -1 for none. */
+    int backdrop, backdrop_previous;
+    Uint32 backdrop_since;
+    /* The header's clock and battery, read once a second. */
+    Uint32 status_read;
+    int status, clock_hour, clock_minute, battery, charging;
+
+    struct launcher_kv look;
+    int show_hidden, hide_missing;
+    char browse_dir[512];
+
+    SDL_Thread *thread;
+    SDL_mutex *mutex;
+    SDL_cond *cond;
+    int stop;
+    struct icon_job jobs[ICON_JOBS];
+    int job_count;
+    struct icon_result results[ICON_JOBS];
+    int result_count;
+    unsigned int icon_use;
+    /* icon_use as the last frame began to draw: what stands above it was asked
+     * for by that frame, so it is on the screen and must not be thrown away. */
+    unsigned int icon_frame;
+    Uint32 icon_event;
+    Uint32 usb_event;
+    SDL_atomic_t usb_changed;
+};
+
+static struct launcher launcher;
+static struct file_entry files[MAX_FILES];
+static struct ui_row file_rows[MAX_FILES + 8];
+
+void wine_nx_launcher_usb_changed(void)
+{
+    SDL_Event event;
+
+    if (!launcher.usb_event) return;
+    SDL_AtomicSet( &launcher.usb_changed, 1 );
+    memset( &event, 0, sizeof(event) );
+    event.type = launcher.usb_event;
+    SDL_PushEvent( &event );
+}
+
+extern int wine_nx_launcher_console_run( const char *drive_c, const char *runtime_dir, const char *build,
+                                         int (*machine_of)( const char *path, unsigned short *machine ),
+                                         int *verbose, int *profile, char *target, size_t target_size );
+
+/***********************************************************************
+ * Platform
+ */
+
+static void launcher_log( const char *format, ... )
+{
+    char line[600];
+    va_list args;
+
+    va_start( args, format );
+    vsnprintf( line, sizeof(line), format, args );
+    va_end( args );
+    wine_nx_runtime_trace( line );
+}
+
+#ifdef __SWITCH__
+static int font_service;
+
+int launcher_platform_font( const void **data, size_t *size )
+{
+    PlFontData font;
+
+    if (R_FAILED( plInitialize( PlServiceType_User ) )) return 0;
+    font_service = 1;
+    if (R_FAILED( plGetSharedFontByType( &font, PlSharedFontType_Standard ) ) || !font.address) return 0;
+    *data = font.address;
+    *size = font.size;
+    return 1;
+}
+
+static int battery_service;    /* 1 open, -1 refused */
+
+static void launcher_platform_font_release(void)
+{
+    /* The fonts read the shared memory until they are closed, so this comes after ui_quit. */
+    if (font_service) plExit();
+    font_service = 0;
+    if (battery_service > 0) psmExit();
+    battery_service = 0;
+}
+
+int launcher_platform_status( int *hour, int *minute, int *battery, int *charging )
+{
+    TimeCalendarTime calendar;
+    TimeCalendarAdditionalInfo info;
+    PsmChargerType charger;
+    u64 now;
+    u32 percent;
+    int found = 0;
+
+    /* The clock the user set, in the time zone they chose. */
+    if (R_SUCCEEDED( timeGetCurrentTime( TimeType_LocalSystemClock, &now ) ) &&
+        R_SUCCEEDED( timeToCalendarTimeWithMyRule( now, &calendar, &info ) ))
+    {
+        *hour = calendar.hour;
+        *minute = calendar.minute;
+        found |= LAUNCHER_STATUS_CLOCK;
+    }
+    if (!battery_service) battery_service = R_SUCCEEDED( psmInitialize() ) ? 1 : -1;
+    if (battery_service > 0 && R_SUCCEEDED( psmGetBatteryChargePercentage( &percent ) ))
+    {
+        *battery = percent;
+        *charging = R_SUCCEEDED( psmGetChargerType( &charger ) ) && charger != PsmChargerType_Unconnected;
+        found |= LAUNCHER_STATUS_BATTERY;
+    }
+    return found;
+}
+
+int launcher_platform_prompt( const char *header, const char *initial, char *out, size_t size )
+{
+    SwkbdConfig keyboard;
+    Result rc;
+
+    if (R_FAILED( swkbdCreate( &keyboard, 0 ) )) return 0;
+    swkbdConfigMakePresetDefault( &keyboard );
+    swkbdConfigSetHeaderText( &keyboard, header );
+    swkbdConfigSetGuideText( &keyboard, header );
+    swkbdConfigSetInitialText( &keyboard, initial );
+    swkbdConfigSetStringLenMax( &keyboard, size - 1 < 500 ? size - 1 : 500 );
+    rc = swkbdShow( &keyboard, out, size );
+    swkbdClose( &keyboard );
+    return R_SUCCEEDED( rc );
+}
+#else
+static void launcher_platform_font_release(void) {}
+#endif
+
+/***********************************************************************
+ * Files
+ */
+
+static int file_exists( const char *path )
+{
+    struct stat st;
+
+    return !stat( path, &st ) && S_ISREG( st.st_mode );
+}
+
+static void runtime_file( const struct launcher *l, const char *name, char *out, size_t size )
+{
+    snprintf( out, size, "%s/%s", l->options->runtime_dir, name );
+}
+
+/* Nonzero when the line reached the card, which the handoff in start_program
+ * has to know before it gives the console away. */
+static int write_line( const char *path, const char *text )
+{
+    FILE *file = fopen( path, "w" );
+
+    if (!file) return 0;
+    return fprintf( file, "%s\n", text ) > 0 && !fclose( file );
+}
+
+static int read_line( const char *path, char *out, size_t size )
+{
+    FILE *file = fopen( path, "r" );
+    int ok;
+
+    out[0] = 0;
+    if (!file) return 0;
+    ok = fgets( out, size, file ) != NULL;
+    fclose( file );
+    out[strcspn( out, "\r\n" )] = 0;
+    return ok;
+}
+
+static const char *file_name( const char *path )
+{
+    const char *slash = strrchr( path, '/' );
+
+    return slash ? slash + 1 : path;
+}
+
+static void parent_dir( char *dir )
+{
+    char *slash = strrchr( dir, '/' );
+
+    if (!slash) return;
+    if (slash == strchr( dir, '/' )) slash[1] = 0;  /* sdmc:/ stays */
+    else *slash = 0;
+}
+
+static int is_root( const char *dir )
+{
+    const char *slash = strchr( dir, '/' );
+
+    return !slash || !slash[1];
+}
+
+/***********************************************************************
+ * Programs
+ */
+
+/* The folder a program sits in, when that is a name rather than a place to put
+ * a binary: FalloutNV.exe says nothing, "Fallout New Vegas" says what it is.
+ * Returns 0 for the usual containers, and for the drive itself. */
+static int folder_title( const char *path, char *out, size_t size )
+{
+    static const char *const containers[] =
+    {
+        "bin", "bin32", "bin64", "binaries", "game", "games", "data", "app", "apps", "system",
+        "win32", "win64", "x86", "x64", "release", "debug", "drive_c", "program files",
+        "program files (x86)", "steamapps", "common", "exe", "build",
+    };
+    const char *end, *start;
+    size_t length, i;
+
+    if (!(end = strrchr( path, '/' )) && !(end = strrchr( path, '\\' ))) return 0;
+    for (start = end; start > path; start--)
+        if (start[-1] == '/' || start[-1] == '\\') break;
+    if (start >= end) return 0;
+    length = end - start;
+    if (length >= size) return 0;
+    for (i = 0; i < sizeof(containers) / sizeof(containers[0]); i++)
+        if (strlen( containers[i] ) == length && !strncasecmp( start, containers[i], length )) return 0;
+    memcpy( out, start, length );
+    out[length] = 0;
+    return 1;
+}
+
+static void load_program_settings( struct launcher *l, struct program *p )
+{
+    char path[768];
+    struct launcher_kv kv;
+    size_t len;
+
+    p->own_files = 0;
+    memset( &p->settings, 0, sizeof(p->settings) );
+    p->settings.verbose = p->settings.profile = p->settings.framebuffer = -1;
+    p->settings.fex = p->settings.four_cores = 1;
+    if (launcher_program_settings_path( l->options->runtime_dir, p->path, path, sizeof(path) ) &&
+        launcher_kv_load( &kv, path ))
+    {
+        launcher_settings_read( &kv, &p->settings );
+        p->own_files |= kv.size && file_exists( path );
+    }
+    if (launcher_args_path( p->path, path, sizeof(path) )) p->own_files |= file_exists( path );
+    if (launcher_keys_path( p->path, path, sizeof(path) )) p->own_files |= file_exists( path );
+    if (launcher_sibling_path( p->path, ".box64.txt", path, sizeof(path) )) p->own_files |= file_exists( path );
+
+    if (p->settings.title[0]) snprintf( p->title, sizeof(p->title), "%s", p->settings.title );
+    else if (p->resource_title[0]) snprintf( p->title, sizeof(p->title), "%s", p->resource_title );
+    else if (!folder_title( p->path, p->title, sizeof(p->title) ))
+    {
+        snprintf( p->title, sizeof(p->title), "%s", file_name( p->path ) );
+        if ((len = strlen( p->title )) > 4 && !strcasecmp( p->title + len - 4, ".exe" )) p->title[len - 4] = 0;
+    }
+}
+
+/* Fill in a program from its file; returns 0 when this runtime cannot start it. */
+static int describe_program( struct launcher *l, struct program *p, const char *path )
+{
+    memset( p, 0, sizeof(*p) );
+    p->settings.verbose = p->settings.profile = p->settings.framebuffer = -1;
+    if ((size_t)snprintf( p->path, sizeof(p->path), "%s", path ) >= sizeof(p->path)) return 0;
+    if (!launcher_dos_path( path, p->dos, sizeof(p->dos) )) return 0;
+    if (l->options->machine_of( path, &p->machine )) return 0;
+    launcher_pe_describe( path, 0, NULL, p->resource_title, sizeof(p->resource_title) );
+    load_program_settings( l, p );
+    return 1;
+}
+
+static void describe_catalog_program( struct launcher *l, struct program *p,
+                                      const struct launcher_catalog_entry *entry )
+{
+    memset( p, 0, sizeof(*p) );
+    p->settings.verbose = p->settings.profile = p->settings.framebuffer = -1;
+    snprintf( p->path, sizeof(p->path), "%s", entry->path );
+    launcher_dos_path( p->path, p->dos, sizeof(p->dos) );
+    p->catalog_id = entry->id;
+    p->added_order = entry->added_order;
+    p->launched_order = entry->launched_order;
+    p->favorite = entry->favorite;
+    snprintf( p->square_art, sizeof(p->square_art), "%s", entry->square_art );
+    snprintf( p->portrait_art, sizeof(p->portrait_art), "%s", entry->portrait_art );
+    snprintf( p->hero_art, sizeof(p->hero_art), "%s", entry->hero_art );
+    p->added = 1;
+    if (file_exists( p->path ) && !l->options->machine_of( p->path, &p->machine ))
+    {
+        launcher_pe_describe( p->path, 0, NULL, p->resource_title, sizeof(p->resource_title) );
+        load_program_settings( l, p );
+    }
+    else p->missing = 1;
+    if (!p->title[0] && entry->title[0]) snprintf( p->title, sizeof(p->title), "%s", entry->title );
+    if (!p->title[0] && folder_title( p->path, p->title, sizeof(p->title) )) return;
+    if (!p->title[0])
+    {
+        size_t len;
+        snprintf( p->title, sizeof(p->title), "%s", file_name( p->path ) );
+        len = strlen( p->title );
+        if (len > 4 && !strcasecmp( p->title + len - 4, ".exe" )) p->title[len - 4] = 0;
+    }
+}
+
+static int find_program( const struct launcher *l, const char *path )
+{
+    int i;
+
+    for (i = 0; i < l->program_count; i++)
+        if (!l->programs[i].removed && !strcasecmp( l->programs[i].path, path )) return i;
+    return -1;
+}
+
+static int add_program( struct launcher *l, const char *path, int added )
+{
+    int index = find_program( l, path );
+
+    if (index >= 0) return index;
+    if (l->program_count >= LAUNCHER_MAX_ENTRIES) return -1;
+    if (!describe_program( l, &l->programs[l->program_count], path )) return -1;
+    l->programs[l->program_count].added = added;
+    return l->program_count++;
+}
+
+static void draw_loading( struct launcher *l, int found )
+{
+    struct ui *ui = &l->ui;
+    char text[64];
+
+    ui_background( ui );
+    ui_header( ui, "Library", NULL );
+    ui_text_centered( ui, ui->large, ui->width / 2, ui->height / 2 - 48, "Looking for programs...", ui->value );
+    snprintf( text, sizeof(text), found == 1 ? "%d program found" : "%d programs found", found );
+    ui_text_centered( ui, ui->small, ui->width / 2, ui->height / 2 + 20, text, ui->dim );
+    ui_present( ui );
+}
+
+static int save_library( struct launcher *l )
+{
+    char path[512];
+    int i;
+    unsigned int next_id = l->catalog.next_id, next_order = l->catalog.next_order;
+    launcher_catalog_init( &l->catalog );
+    l->catalog.next_id = next_id;
+    l->catalog.next_order = next_order;
+    for (i = 0; i < l->program_count; i++)
+    {
+        struct program *p = &l->programs[i];
+        struct launcher_catalog_entry *entry;
+        if (p->removed || !p->added) continue;
+        entry = &l->catalog.entries[l->catalog.count++];
+        if (!p->catalog_id) p->catalog_id = l->catalog.next_id++;
+        if (!p->added_order) p->added_order = l->catalog.next_order++;
+        entry->id = p->catalog_id;
+        entry->added_order = p->added_order;
+        snprintf( entry->path, sizeof(entry->path), "%s", p->path );
+        snprintf( entry->title, sizeof(entry->title), "%s", p->title );
+        entry->launched_order = p->launched_order;
+        entry->favorite = p->favorite;
+        snprintf( entry->square_art, sizeof(entry->square_art), "%s", p->square_art );
+        snprintf( entry->portrait_art, sizeof(entry->portrait_art), "%s", p->portrait_art );
+        snprintf( entry->hero_art, sizeof(entry->hero_art), "%s", p->hero_art );
+        if (entry->id >= l->catalog.next_id) l->catalog.next_id = entry->id + 1;
+        if (entry->added_order >= l->catalog.next_order) l->catalog.next_order = entry->added_order + 1;
+        if (entry->launched_order >= l->catalog.next_order) l->catalog.next_order = entry->launched_order + 1;
+    }
+    runtime_file( l, LAUNCHER_CATALOG_FILE, path, sizeof(path) );
+    if (!launcher_catalog_save( &l->catalog, path ))
+    {
+        ui_toast( &l->ui, "Could not save the game library", 2500 );
+        return 0;
+    }
+    return 1;
+}
+
+static void load_library( struct launcher *l )
+{
+    char path[512], legacy[512];
+    enum launcher_catalog_result result;
+    int i;
+
+    draw_loading( l, 0 );
+    runtime_file( l, LAUNCHER_CATALOG_FILE, path, sizeof(path) );
+    result = launcher_catalog_load( &l->catalog, path );
+    if (result == LAUNCHER_CATALOG_MISSING)
+    {
+        launcher_catalog_init( &l->catalog );
+        runtime_file( l, "launcher-library.txt", legacy, sizeof(legacy) );
+        if (!launcher_catalog_import_legacy( &l->catalog, legacy ) || !launcher_catalog_save( &l->catalog, path ))
+            ui_message( &l->ui, "Library", "The saved game library could not be migrated." );
+    }
+    else if (result != LAUNCHER_CATALOG_OK)
+    {
+        launcher_catalog_init( &l->catalog );
+        ui_message( &l->ui, "Library", "The game library is unreadable. It was preserved and no games were loaded." );
+    }
+    for (i = 0; i < l->catalog.count && l->program_count < LAUNCHER_MAX_ENTRIES; i++)
+        describe_catalog_program( l, &l->programs[l->program_count++], &l->catalog.entries[i] );
+}
+
+static struct launcher *sort_launcher;
+
+static int contains_case( const char *text, const char *needle )
+{
+    size_t len = strlen( needle );
+    if (!len) return 1;
+    while (*text)
+    {
+        if (!strncasecmp( text, needle, len )) return 1;
+        text++;
+    }
+    return 0;
+}
+
+static int compare_visible( const void *a, const void *b )
+{
+    const struct program *x = &sort_launcher->programs[*(const int *)a];
+    const struct program *y = &sort_launcher->programs[*(const int *)b];
+    int order;
+
+    if (sort_launcher->sort_order == 1 && x->added_order != y->added_order)
+        return x->added_order < y->added_order ? 1 : -1;
+    if (sort_launcher->sort_order == 2 && x->launched_order != y->launched_order)
+        return x->launched_order < y->launched_order ? 1 : -1;
+    order = strcasecmp( x->title, y->title );
+
+    return order ? order : strcasecmp( x->dos, y->dos );
+}
+
+/* The programs shown, sorted by title; keep_index stays selected when it is shown. */
+static void rebuild_visible( struct launcher *l, int keep_index )
+{
+    int i;
+
+    l->visible_count = 0;
+    for (i = 0; i < l->program_count; i++)
+    {
+        const struct program *p = &l->programs[i];
+
+        if (p->removed || (l->hide_missing && p->missing) || (p->settings.hidden && !l->show_hidden) ||
+            (l->favorites_only && !p->favorite) || !contains_case( p->title, l->search )) continue;
+        l->visible[l->visible_count++] = i;
+    }
+    sort_launcher = l;
+    qsort( l->visible, l->visible_count, sizeof(l->visible[0]), compare_visible );
+    for (i = 0; i < l->visible_count; i++)
+        if (l->visible[i] == keep_index) l->selection = i;
+    if (l->selection >= l->visible_count) l->selection = l->visible_count ? l->visible_count - 1 : 0;
+}
+
+/* Home lists what has been played, most recently started first; nothing else. */
+static int compare_history( const void *a, const void *b )
+{
+    const struct program *x = &sort_launcher->programs[*(const int *)a];
+    const struct program *y = &sort_launcher->programs[*(const int *)b];
+
+    if (x->launched_order != y->launched_order) return x->launched_order < y->launched_order ? 1 : -1;
+    return strcasecmp( x->title, y->title );
+}
+
+static void rebuild_history( struct launcher *l, int keep_index )
+{
+    int i;
+
+    l->history_count = 0;
+    for (i = 0; i < l->program_count; i++)
+    {
+        const struct program *p = &l->programs[i];
+
+        if (p->removed || !p->launched_order || (l->hide_missing && p->missing) ||
+            (p->settings.hidden && !l->show_hidden)) continue;
+        l->history[l->history_count++] = i;
+    }
+    sort_launcher = l;
+    qsort( l->history, l->history_count, sizeof(l->history[0]), compare_history );
+    for (i = 0; i < l->history_count; i++)
+        if (l->history[i] == keep_index) l->history_selection = i;
+    if (l->history_selection >= l->history_count) l->history_selection = l->history_count ? l->history_count - 1 : 0;
+}
+
+static void save_program_settings( struct launcher *l, struct program *p )
+{
+    struct launcher_kv kv;
+    char path[768], folder[768];
+    int ready = 1;
+
+    if (launcher_settings_on_usb( p->path ))
+    {
+        runtime_file( l, "program-settings", folder, sizeof(folder) );
+        ready = !mkdir( folder, 0777 ) || errno == EEXIST;
+    }
+    if (!ready || !launcher_program_settings_path( l->options->runtime_dir, p->path, path, sizeof(path) ) ||
+        !launcher_kv_load( &kv, path ) || !launcher_settings_write( &kv, &p->settings ) ||
+        !launcher_kv_save( &kv, path ))
+        ui_toast( &l->ui, "Could not save the program's settings", 2500 );
+    load_program_settings( l, p );
+}
+
+static void apply_new_game_renderer( struct launcher *l, struct program *p )
+{
+    char path[768], value[64];
+    struct launcher_kv kv;
+
+    if (l->options->dxvk_on_add || !launcher_dxvk_directory( p->machine, p->settings.dxvk_source ) ||
+        !launcher_program_settings_path( l->options->runtime_dir, p->path, path, sizeof(path) ) ||
+        !launcher_kv_load( &kv, path ) || launcher_kv_get( &kv, "d3d", value, sizeof(value) ) ||
+        launcher_kv_get( &kv, "d3d9", value, sizeof(value) )) return;
+    p->settings.d3d = LAUNCHER_D3D_WINE;
+    save_program_settings( l, p );
+}
+
+/***********************************************************************
+ * Icons
+ */
+
+static int decode_png( struct launcher_icon *icon )
+{
+    struct launcher_icon decoded = {0};
+    if (!launcher_image_decode( icon->data, icon->size, &decoded )) return 0;
+    if (decoded.width > LAUNCHER_ICON_MAX_SIDE || decoded.height > LAUNCHER_ICON_MAX_SIDE)
+    {
+        launcher_icon_free( &decoded );
+        return 0;
+    }
+    launcher_icon_free( icon );
+    *icon = decoded;
+    return 1;
+}
+
+/* The mark the shell shows in its corner, carried inside the runtime. */
+static SDL_Texture *load_logo( struct launcher *l )
+{
+#ifdef WINE_NX_HAS_EMBEDDED_LOGO
+    struct launcher_icon icon;
+    SDL_Texture *texture = NULL;
+    SDL_Surface *surface;
+
+    memset( &icon, 0, sizeof(icon) );
+    icon.size = wine_nx_logo_size;
+    if (!icon.size || !(icon.data = malloc( icon.size ))) return NULL;
+    memcpy( icon.data, wine_nx_logo, icon.size );
+    if (!decode_png( &icon )) { free( icon.data ); return NULL; }
+    if ((surface = SDL_CreateRGBSurfaceWithFormatFrom( icon.data, icon.width, icon.height, 32,
+                                                       icon.width * 4, SDL_PIXELFORMAT_ABGR8888 )))
+    {
+        texture = SDL_CreateTextureFromSurface( l->ui.renderer, surface );
+        SDL_FreeSurface( surface );
+    }
+    free( icon.data );
+    return texture;
+#else
+    (void)l;
+    return NULL;
+#endif
+}
+
+/* Cover files are optional. Decode on the existing worker, with bounded input. */
+static int read_cover( const char *path, struct launcher_icon *icon )
+{
+    if (!launcher_image_load( path, icon )) return 0;
+    if (!launcher_icon_fit( icon, 512 )) { launcher_icon_free( icon ); return 0; }
+    return 1;
+}
+
+static int icon_thread( void *arg )
+{
+    struct launcher *l = arg;
+
+    SDL_LockMutex( l->mutex );
+    while (!l->stop)
+    {
+        struct launcher_icon icon;
+        struct icon_result result;
+        struct icon_job job;
+        SDL_Event event;
+
+        if (!l->job_count || l->result_count == ICON_JOBS)
+        {
+            SDL_CondWait( l->cond, l->mutex );
+            continue;
+        }
+        /* The newest request first: what the screen shows now, not what it
+         * showed while the list scrolled past. */
+        job = l->jobs[--l->job_count];
+        SDL_UnlockMutex( l->mutex );
+
+        memset( &icon, 0, sizeof(icon) );
+        result.artwork = read_cover( job.artwork, &icon );
+        if (!result.artwork && job.kind == ART_PORTRAIT)
+        {
+            launcher_pe_describe( job.path, ICON_SIDE, &icon, NULL, 0 );
+            if (icon.kind == LAUNCHER_ICON_PNG && !decode_png( &icon )) launcher_icon_free( &icon );
+            if (icon.kind == LAUNCHER_ICON_RGBA && !launcher_icon_fit( &icon, ICON_SIDE )) launcher_icon_free( &icon );
+        }
+        result.index = job.index;
+        result.kind = job.kind;
+        result.generation = job.generation;
+        result.width = icon.width;
+        result.height = icon.height;
+        result.rgba = icon.kind == LAUNCHER_ICON_RGBA ? icon.data : NULL;
+        if (!result.rgba) launcher_icon_free( &icon );
+
+        SDL_LockMutex( l->mutex );
+        l->results[l->result_count++] = result;
+        memset( &event, 0, sizeof(event) );
+        event.type = l->icon_event;
+        SDL_PushEvent( &event );
+    }
+    SDL_UnlockMutex( l->mutex );
+    return 0;
+}
+
+static void start_icons( struct launcher *l )
+{
+    l->icon_event = SDL_RegisterEvents( 1 );
+    if (l->icon_event == (Uint32)-1) l->icon_event = SDL_USEREVENT;
+    l->mutex = SDL_CreateMutex();
+    l->cond = SDL_CreateCond();
+    if (l->mutex && l->cond) l->thread = SDL_CreateThreadWithStackSize( icon_thread, "launcher icons", 256 * 1024, l );
+}
+
+static void stop_icons( struct launcher *l )
+{
+    int i;
+
+    if (l->thread)
+    {
+        SDL_LockMutex( l->mutex );
+        l->stop = 1;
+        SDL_CondSignal( l->cond );
+        SDL_UnlockMutex( l->mutex );
+        SDL_WaitThread( l->thread, NULL );
+    }
+    for (i = 0; i < l->result_count; i++) free( l->results[i].rgba );
+    l->result_count = l->job_count = 0;
+    for (i = 0; i < l->program_count; i++)
+    {
+        if (l->programs[i].icon) SDL_DestroyTexture( l->programs[i].icon );
+        if (l->programs[i].square_icon) SDL_DestroyTexture( l->programs[i].square_icon );
+        if (l->programs[i].hero_icon) SDL_DestroyTexture( l->programs[i].hero_icon );
+        l->programs[i].icon = NULL;
+        l->programs[i].square_icon = l->programs[i].hero_icon = NULL;
+    }
+    if (l->cond) SDL_DestroyCond( l->cond );
+    if (l->mutex) SDL_DestroyMutex( l->mutex );
+    l->thread = NULL;
+    l->cond = NULL;
+    l->mutex = NULL;
+}
+
+/* One of a program's three pictures, as the cache sees it. */
+struct art
+{
+    SDL_Texture **texture;
+    int *width, *height;
+    enum icon_state *state;
+    unsigned int *use;
+};
+
+static struct art art_of( struct program *p, int kind )
+{
+    if (kind == ART_SQUARE)
+        return (struct art){ &p->square_icon, &p->square_width, &p->square_height, &p->square_state, &p->square_use };
+    if (kind == ART_HERO)
+        return (struct art){ &p->hero_icon, &p->hero_width, &p->hero_height, &p->hero_state, &p->hero_use };
+    return (struct art){ &p->icon, &p->icon_width, &p->icon_height, &p->icon_state, &p->icon_use };
+}
+
+static unsigned long long art_bytes( int width, int height )
+{
+    return (unsigned long long)width * height * 4;
+}
+
+/* How far in art that arrived at since is: all of it after ART_FADE_MS. */
+static int fade_in( const struct ui *ui, Uint32 since )
+{
+    Uint32 age = SDL_GetTicks() - since;
+
+    return !ui->animations || age >= ART_FADE_MS ? 255 : (int)(age * 255 / ART_FADE_MS);
+}
+
+static void pump_icons( struct launcher *l )
+{
+    struct icon_result results[ICON_JOBS];
+    unsigned long long held = 0;
+    int count, left, i, kind, oldest;
+
+    if (!l->thread) return;
+    /* A few to the GPU each frame, the oldest first: making every cover that
+     * came in at once into a texture in one frame is a frame that hitches
+     * while the list moves. The rest wait for the next ones. */
+    SDL_LockMutex( l->mutex );
+    count = l->result_count < ICON_UPLOADS ? l->result_count : ICON_UPLOADS;
+    memcpy( results, l->results, count * sizeof(results[0]) );
+    l->result_count -= count;
+    memmove( l->results, l->results + count, l->result_count * sizeof(results[0]) );
+    left = l->result_count;
+    SDL_CondSignal( l->cond );
+    SDL_UnlockMutex( l->mutex );
+    /* Those left wake the loop again for the next frame. */
+    if (left)
+    {
+        SDL_Event event;
+
+        memset( &event, 0, sizeof(event) );
+        event.type = l->icon_event;
+        SDL_PushEvent( &event );
+    }
+
+    for (i = 0; i < count; i++)
+    {
+        struct program *p = &l->programs[results[i].index];
+        SDL_Texture *texture = NULL;
+
+        if (results[i].generation != p->art_generation[results[i].kind])
+        { free( results[i].rgba ); continue; }
+        if (results[i].rgba &&
+            (texture = SDL_CreateTexture( l->ui.renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC,
+                                          results[i].width, results[i].height )))
+        {
+            SDL_UpdateTexture( texture, NULL, results[i].rgba, results[i].width * 4 );
+            SDL_SetTextureBlendMode( texture, SDL_BLENDMODE_BLEND );
+        }
+        free( results[i].rgba );
+        if (results[i].kind == ART_SQUARE)
+        {
+            p->square_icon = texture; p->square_width = results[i].width; p->square_height = results[i].height;
+            p->square_time = SDL_GetTicks(); p->square_state = texture ? ICON_READY : ICON_MISSING;
+        }
+        else if (results[i].kind == ART_HERO)
+        {
+            p->hero_icon = texture; p->hero_width = results[i].width; p->hero_height = results[i].height;
+            p->hero_time = SDL_GetTicks(); p->hero_state = texture ? ICON_READY : ICON_MISSING;
+        }
+        else
+        {
+            p->icon = texture; p->icon_width = results[i].width; p->icon_height = results[i].height;
+            p->icon_is_art = results[i].artwork; p->icon_time = SDL_GetTicks();
+            p->icon_state = texture ? ICON_READY : ICON_MISSING;
+        }
+    }
+
+    /* Keep what was shown most recently, up to the budget, and never what the
+     * frame being drawn asked for. */
+    for (i = 0; i < l->program_count; i++)
+        for (kind = 0; kind < 3; kind++)
+        {
+            struct art a = art_of( &l->programs[i], kind );
+            if (*a.texture) held += art_bytes( *a.width, *a.height );
+        }
+    while (held > ICON_BUDGET)
+    {
+        int oldest_kind = 0;
+        unsigned int oldest_use = 0;
+
+        oldest = -1;
+        for (i = 0; i < l->program_count; i++)
+            for (kind = 0; kind < 3; kind++)
+            {
+                struct art a = art_of( &l->programs[i], kind );
+                if (!*a.texture || *a.use > l->icon_frame || (oldest >= 0 && *a.use >= oldest_use)) continue;
+                oldest = i;
+                oldest_kind = kind;
+                oldest_use = *a.use;
+            }
+        /* Everything held is on the screen now: keep it and let the frame be
+         * over the budget rather than throw away a cover about to be drawn. */
+        if (oldest < 0) break;
+        {
+            struct art a = art_of( &l->programs[oldest], oldest_kind );
+            held -= art_bytes( *a.width, *a.height );
+            SDL_DestroyTexture( *a.texture );
+            *a.texture = NULL;
+            *a.state = ICON_UNKNOWN;
+        }
+    }
+}
+
+static void request_art( struct launcher *l, int index, enum art_kind kind )
+{
+    struct program *p = &l->programs[index];
+    struct art a = art_of( p, kind );
+    enum icon_state *state = a.state;
+    const char *art = kind == ART_SQUARE ? p->square_art : kind == ART_HERO ? p->hero_art : p->portrait_art;
+
+    *a.use = ++l->icon_use;
+    if (*state != ICON_UNKNOWN || !l->thread) return;
+    SDL_LockMutex( l->mutex );
+    /* The worker takes the newest first; a full queue lets go of the oldest,
+     * asked for by a screen long gone, which is asked for again if it comes back. */
+    if (l->job_count == ICON_JOBS)
+    {
+        struct icon_job *job = &l->jobs[0];
+        if (job->generation == l->programs[job->index].art_generation[job->kind])
+            *art_of( &l->programs[job->index], job->kind ).state = ICON_UNKNOWN;
+        memmove( l->jobs, l->jobs + 1, --l->job_count * sizeof(l->jobs[0]) );
+    }
+    {
+        l->jobs[l->job_count].index = index;
+        l->jobs[l->job_count].kind = kind;
+        l->jobs[l->job_count].generation = p->art_generation[kind];
+        memcpy( l->jobs[l->job_count].path, p->path, sizeof(p->path) );
+        if (art[0])
+            snprintf( l->jobs[l->job_count].artwork, sizeof(l->jobs[0].artwork), "%s",
+                      art );
+        else if (kind == ART_PORTRAIT)
+        {
+            char folder[512];
+            snprintf( folder, sizeof(folder), "%s", p->path );
+            parent_dir( folder );
+            if (snprintf( l->jobs[l->job_count].artwork, sizeof(l->jobs[0].artwork), "%s/cover.png", folder ) >=
+                (int)sizeof(l->jobs[0].artwork)) l->jobs[l->job_count].artwork[0] = 0;
+        }
+        else l->jobs[l->job_count].artwork[0] = 0;
+        l->job_count++;
+        *state = ICON_QUEUED;
+        SDL_CondSignal( l->cond );
+    }
+    SDL_UnlockMutex( l->mutex );
+}
+
+static void request_icon( struct launcher *l, int index ) { request_art( l, index, ART_PORTRAIT ); }
+
+/***********************************************************************
+ * Library grid
+ */
+
+struct grid
+{
+    int card, gap_x, gap_y, caption, x0, y0, columns, rows, first;
+};
+
+static void draw_shell( struct launcher *l, int home );
+static void draw_footprint( struct launcher *l );
+static void draw_backdrop( struct launcher *l, int current );
+static void draw_cover( struct ui *ui, const struct program *p, SDL_Rect rect, int radius, int brightness,
+                        int alpha );
+
+#define GRID_CARD_TARGET 200
+
+static void grid_layout( const struct launcher *l, struct grid *g )
+{
+    const struct ui *ui = &l->ui;
+    int width = ui->width - 2 * SHELL_MARGIN, available = ui->height - UI_HEADER_HEIGHT - FOOTER_SPACE, h, page_size;
+
+    g->gap_x = 22;
+    g->gap_y = 16;
+    g->caption = 36;
+    g->columns = (width + g->gap_x) / (GRID_CARD_TARGET + g->gap_x);
+    if (g->columns < 1) g->columns = 1;
+    g->card = (width - (g->columns - 1) * g->gap_x) / g->columns;
+    if (g->card < 64) g->card = 64;
+    g->rows = (available - 24 + g->gap_y) / (g->card + g->caption + g->gap_y);
+    if (g->rows < 1) g->rows = 1;
+    page_size = g->columns * g->rows;
+    g->first = l->selection / page_size * page_size;
+    h = g->rows * (g->card + g->caption) + (g->rows - 1) * g->gap_y;
+    g->x0 = SHELL_MARGIN;
+    g->y0 = UI_HEADER_HEIGHT + (available - h) / 2 + 4;
+}
+
+static int grid_hit( const struct launcher *l, int x, int y )
+{
+    int row, column, hit;
+    struct grid g;
+
+    grid_layout( l, &g );
+    if (x < g.x0 || y < g.y0) return -1;
+    column = (x - g.x0) / (g.card + g.gap_x);
+    row = (y - g.y0) / (g.card + g.caption + g.gap_y);
+    if (column >= g.columns || row >= g.rows) return -1;
+    if ((x - g.x0) % (g.card + g.gap_x) >= g.card || (y - g.y0) % (g.card + g.caption + g.gap_y) >= g.card + g.caption)
+        return -1;
+    hit = g.first + row * g.columns + column;
+    return hit < l->visible_count ? hit : -1;
+}
+
+/* A window with a title bar and the program's first letter, for programs without an icon. */
+static void draw_placeholder( struct launcher *l, const struct program *p, int cx, int cy, int size, int alpha )
+{
+    struct ui *ui = &l->ui;
+    SDL_Color frame = ui->dim, fill = { 0, 0, 0, 60 * alpha / 255 };
+    int w = size, h = size * 3 / 4, x = cx - w / 2, y = cy - h / 2;
+    char letter[8] = {0};
+    size_t len = 1;
+
+    frame.a = 200 * alpha / 255;
+    ui_rounded( ui, x, y, w, h, 8, fill );
+    ui_border( ui, x, y, w, h, 2, frame );
+    ui_fill( ui, x, y, w, h / 6, frame );
+    while ((p->title[len] & 0xc0) == 0x80 && len < 4) len++;
+    memcpy( letter, p->title, p->title[0] ? len : 0 );
+    if (letter[0] >= 'a' && letter[0] <= 'z') letter[0] -= 'a' - 'A';
+    frame.a = alpha;
+    ui_text_centered( ui, ui->large, cx, y + h / 6 + (h * 5 / 6 - TTF_FontHeight( ui->large )) / 2, letter, frame );
+}
+
+static void draw_card( struct launcher *l, int index, int x, int y, const struct grid *g, int current )
+{
+    struct ui *ui = &l->ui;
+    struct program *p = &l->programs[l->visible[index]];
+    int cx = x + g->card / 2, cy = y + g->card / 2, target = g->card * 60 / 100, dim = current ? 255 : 165;
+    SDL_Color caption = current ? ui->value : ui->dim;
+    int text_w;
+
+    /* A game with a square cover waits for it, on its bare card, rather than
+     * show its portrait art and swap it for the square one a moment later. */
+    int square = p->square_art[0] && p->square_state != ICON_MISSING;
+
+    request_art( l, l->visible[index], ART_SQUARE );
+    if (!square) request_icon( l, l->visible[index] );
+    if (current)
+    {
+        if (ui->glow)
+        {
+            SDL_Rect rect = { x - g->card / 4, y - g->card / 4, g->card * 3 / 2, g->card * 3 / 2 };
+
+            SDL_SetTextureColorMod( ui->glow, 255, 255, 255 );
+            SDL_SetTextureAlphaMod( ui->glow, 40 );
+            SDL_RenderCopy( ui->renderer, ui->glow, NULL, &rect );
+        }
+        /* The same light that goes round what has the focus everywhere else,
+         * rather than a plate of its own: the two views frame the selection the
+         * same way, and the way the rest of the launcher does. */
+        ui_animated_border( ui, x - 3, y - 3, g->card + 6, g->card + 6, 17, 3,
+                            (SDL_Color){ 150, 160, 176, 90 }, (SDL_Color){ 244, 247, 250, 255 } );
+    }
+    else
+    {
+        ui_rounded( ui, x + 4, y + 6, g->card, g->card, 14, (SDL_Color){ 0, 0, 0, 55 } );
+        ui_rounded( ui, x + 2, y + 3, g->card, g->card, 14, (SDL_Color){ 0, 0, 0, 70 } );
+    }
+    ui_rounded( ui, x, y, g->card, g->card, 14, current ? ui->focus : ui->card );
+    ui_fill( ui, x + 14, y, g->card - 28, 1, (SDL_Color){ 255, 255, 255, 30 } );
+
+    if (p->square_icon)
+    {
+        SDL_Rect src = {0, 0, p->square_width, p->square_height};
+        ui_rounded_texture( ui, p->square_icon, &src, (SDL_Rect){x, y, g->card, g->card}, 14,
+                            (SDL_Color){ current ? 255 : 190, current ? 255 : 190, current ? 255 : 190,
+                                         fade_in( ui, p->square_time ) } );
+    }
+    else if (square) ;
+    else if (p->icon && p->icon_is_art)
+        draw_cover( ui, p, (SDL_Rect){x, y, g->card, g->card}, 14, current ? 255 : 190, fade_in( ui, p->icon_time ) );
+    else if (p->icon)
+    {
+        int side = p->icon_width > p->icon_height ? p->icon_width : p->icon_height, scale, w, h;
+        SDL_Rect dst;
+
+        /* Small pixel-art icons grow by whole steps so their pixels stay square. */
+        if (side * 2 <= target)
+        {
+            scale = target / side;
+            SDL_SetTextureScaleMode( p->icon, SDL_ScaleModeNearest );
+        }
+        else
+        {
+            scale = 0;
+            SDL_SetTextureScaleMode( p->icon, SDL_ScaleModeLinear );
+        }
+        w = scale ? p->icon_width * scale : p->icon_width * target / side;
+        h = scale ? p->icon_height * scale : p->icon_height * target / side;
+        dst = (SDL_Rect){ cx - w / 2, cy - h / 2 - 4, w, h };
+        SDL_SetTextureColorMod( p->icon, dim, dim, dim );
+        SDL_SetTextureAlphaMod( p->icon, fade_in( ui, p->icon_time ) );
+        SDL_RenderCopy( ui->renderer, p->icon, NULL, &dst );
+    }
+    /* Only a program that has no picture at all gets the drawn one. */
+    else if (p->icon_state == ICON_MISSING) draw_placeholder( l, p, cx, cy - 4, target, dim );
+
+    if (p->settings.hidden)
+    {
+        text_w = ui_text_width( ui, ui->small, "Hidden" );
+        ui_rounded( ui, x + g->card - text_w - 26, y + g->card - 32, text_w + 16, TTF_FontHeight( ui->small ) + 4, 10,
+                    (SDL_Color){ 0, 0, 0, 140 } );
+        ui_text( ui, ui->small, x + g->card - text_w - 18, y + g->card - 30, "Hidden", ui->dim );
+    }
+
+    ui->verbatim_text = 1;
+    text_w = ui_text_width( ui, ui->small, p->title );
+    if (text_w > g->card + g->gap_x - 6) text_w = g->card + g->gap_x - 6;
+    ui_text_fit( ui, ui->small, cx - text_w / 2, y + g->card + 8, g->card + g->gap_x - 6, p->title, caption, current );
+    ui->verbatim_text = 0;
+}
+
+/* What a card will draw, asked for ahead of it. */
+static void prefetch_card( struct launcher *l, int index )
+{
+    struct program *p = &l->programs[l->visible[index]];
+
+    request_art( l, l->visible[index], ART_SQUARE );
+    if (!p->square_art[0] || p->square_state == ICON_MISSING) request_icon( l, l->visible[index] );
+}
+
+static void draw_library( struct launcher *l )
+{
+    /* A does what is in focus: with the header in focus it is that, not the game
+     * the selection is remembered on. */
+    struct ui_hint hints[] = { { UI_A, "Play" }, { UI_Y, "Options" }, { UI_PLUS, "Menu" } };
+    /* With nothing to act on, only the menu means anything. */
+    static const struct ui_hint empty_hints[] = { { UI_PLUS, "Menu" } };
+    struct ui *ui = &l->ui;
+    struct grid g;
+    int shown, i;
+
+    if (l->zone == ZONE_HEADER) hints[0].label = "Select";
+
+    if (l->selection + 1 < l->visible_count) request_art( l, l->visible[l->selection + 1], ART_HERO );
+    if (l->selection > 0) request_art( l, l->visible[l->selection - 1], ART_HERO );
+    draw_backdrop( l, l->visible_count ? l->visible[l->selection] : -1 );
+    ui_fill( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 0, 0, 0, 120 } );
+    grid_layout( l, &g );
+    shown = g.columns * g.rows;
+
+    draw_shell( l, 0 );
+    /* The pages either side, before this one: the worker takes the newest
+     * request first, so what is on the screen still comes first, and a page
+     * turned to is already there. They ask for what a card draws. */
+    for (i = g.first + shown; i < l->visible_count && i < g.first + 2 * shown; i++) prefetch_card( l, i );
+    for (i = g.first - shown > 0 ? g.first - shown : 0; i < g.first; i++) prefetch_card( l, i );
+    for (i = g.first; i < l->visible_count && i < g.first + shown; i++)
+    {
+        int column = (i - g.first) % g.columns, row = (i - g.first) / g.columns;
+
+        if (i == l->selection) continue;
+        draw_card( l, i, g.x0 + column * (g.card + g.gap_x), g.y0 + row * (g.card + g.caption + g.gap_y), &g, 0 );
+    }
+    if (l->visible_count && l->selection >= g.first && l->selection < g.first + shown)
+    {
+        int column = (l->selection - g.first) % g.columns, row = (l->selection - g.first) / g.columns;
+
+        /* Framed only while the games themselves have the focus: with the
+         * header in focus the selection is remembered, not pointed at. */
+        draw_card( l, l->selection, g.x0 + column * (g.card + g.gap_x),
+                   g.y0 + row * (g.card + g.caption + g.gap_y), &g, l->zone != ZONE_HEADER );
+    }
+
+    if (!l->visible_count)
+    {
+        ui_text_centered( ui, ui->large, ui->width / 2, ui->height / 2 - 70,
+                          l->program_count ? "No games match this view" : "Your library is empty", ui->value );
+        ui_text_wrapped( ui, ui->normal, ui->width / 2, ui->height / 2, 900, 3,
+                         l->program_count ? "Change the search or favorite filter, or show hidden games in Settings."
+                                          : "Press + and choose Add game to browse for a Windows executable.",
+                         ui->dim, 1 );
+    }
+    if (l->visible_count > shown)
+    {
+        char page[32];
+
+        snprintf( page, sizeof(page), "Page %d / %d", g.first / shown + 1,
+                  (l->visible_count + shown - 1) / shown );
+        ui_text( ui, ui->small, SHELL_MARGIN, HOME_HINT_Y - TTF_FontHeight( ui->small ) / 2, page, ui->dim );
+    }
+    if (l->visible_count)
+        ui_hints_right( ui, hints, sizeof(hints) / sizeof(hints[0]),
+                        ui->width - SHELL_MARGIN, HOME_HINT_Y );
+    else ui_hints_right( ui, empty_hints, 1, ui->width - SHELL_MARGIN, HOME_HINT_Y );
+    ui_fade( ui );
+}
+
+static int draw_symbol( struct launcher *l, enum symbol symbol, int x, int cy, int alpha )
+{
+    SDL_Texture *texture = l->symbols[symbol];
+    SDL_Rect dst;
+
+    if (!texture || SDL_QueryTexture( texture, NULL, NULL, &dst.w, &dst.h )) return 0;
+    dst.x = x;
+    dst.y = cy - dst.h / 2;
+    SDL_SetTextureAlphaMod( texture, alpha );
+    SDL_RenderCopy( l->ui.renderer, texture, NULL, &dst );
+    return dst.w;
+}
+
+static void draw_battery( struct ui *ui, int x, int cy, int percent, int charging )
+{
+    const SDL_Color line = { 255, 255, 255, 235 };
+    const int w = 26, h = 13, y = cy - h / 2;
+    int level = (w - 6) * (percent < 0 ? 0 : percent > 100 ? 100 : percent) / 100;
+
+    ui_fill( ui, x + 1, y, w - 2, 2, line );
+    ui_fill( ui, x + 1, y + h - 2, w - 2, 2, line );
+    ui_fill( ui, x, y + 1, 2, h - 2, line );
+    ui_fill( ui, x + w - 2, y + 1, 2, h - 2, line );
+    ui_fill( ui, x + w + 1, y + 4, 2, h - 8, line );
+    ui_fill( ui, x + 3, y + 3, level, h - 6, charging ? (SDL_Color){ 124, 222, 146, 255 } : line );
+}
+
+static const char *const shell_labels[SHELL_TABS] = { "Home", "Library" };
+
+/* How wide a header item is: its icon, and as much of the name as is out. */
+static int shell_width( struct launcher *l, int tab )
+{
+    int width = 0;
+
+    if (l->symbols[tab]) SDL_QueryTexture( l->symbols[tab], NULL, NULL, &width, NULL );
+    if (shell_labels[tab])
+        width += (int)((12 + ui_text_width( &l->ui, l->ui.normal, shell_labels[tab] )) * l->label_open[tab] + 0.5f);
+    return width;
+}
+
+/* The clock and the battery, at the right of whichever header asks for them.
+ * Returns where the left of what it drew is. */
+static int draw_status( struct launcher *l, int right, int cy )
+{
+    struct ui *ui = &l->ui;
+    Uint32 now = SDL_GetTicks();
+    char text[32];
+
+    if (!l->status_read || now - l->status_read >= 1000)
+    {
+        l->status = launcher_platform_status( &l->clock_hour, &l->clock_minute, &l->battery, &l->charging );
+        l->status_read = now ? now : 1;
+    }
+    if (l->status & LAUNCHER_STATUS_BATTERY)
+    {
+        snprintf( text, sizeof(text), "%d%%", l->battery );
+        right -= ui_text_width( ui, ui->small, text );
+        ui_text( ui, ui->small, right, cy - TTF_FontHeight( ui->small ) / 2, text, ui->value );
+        right -= 8 + 29;
+        draw_battery( ui, right, cy, l->battery, l->charging );
+        right -= 24;
+    }
+    if (l->status & LAUNCHER_STATUS_CLOCK)
+    {
+        snprintf( text, sizeof(text), "%02d:%02d", l->clock_hour, l->clock_minute );
+        right -= ui_text_width( ui, ui->small, text );
+        ui_text( ui, ui->small, right, cy - TTF_FontHeight( ui->small ) / 2, text, ui->value );
+    }
+    return right;
+}
+
+/* What a header outside the shell asks for, through the ui. */
+static void header_status( void *data, int right, int y )
+{
+    struct launcher *l = data;
+
+    l->ui.status_left = draw_status( l, right, y );
+}
+
+/* The header over Home and Library: the current view's icon and name, the other
+ * views and Add Game as icons, and Settings, the clock and the battery at the right. */
+static void draw_shell( struct launcher *l, int home )
+{
+    static const struct { enum symbol symbol; const char *label; } tabs[] =
+    {
+        [SHELL_HOME] = { SYMBOL_HOME, "Home" },
+        [SHELL_LIBRARY] = { SYMBOL_LIBRARY, "Library" },
+    };
+    struct ui *ui = &l->ui;
+    int x = SHELL_MARGIN, right = ui->width - SHELL_MARGIN, i, width;
+
+    ui_gradient( ui, 0, 0, ui->width, 150, (SDL_Color){ 0, 0, 0, 150 }, (SDL_Color){ 0, 0, 0, 0 }, 0 );
+    /* One name closes as the other opens, and everything after them moves with
+     * it: the widths below are measured from where they have got to. */
+    for (i = SHELL_HOME; i < SHELL_TABS; i++)
+    {
+        float target = i == (home ? SHELL_HOME : SHELL_LIBRARY) ? 1.0f : 0.0f;
+
+        if (!ui->animations) l->label_open[i] = target;
+        else l->label_open[i] += (target - l->label_open[i]) * 0.22f;
+        if (fabsf( target - l->label_open[i] ) < 0.004f) l->label_open[i] = target;
+    }
+
+    /* The clock and the battery first: Settings stands to the left of whatever
+     * they take, and the pill has to know where that is before it goes there. */
+    ui->status_left = right = draw_status( l, right, SHELL_Y );
+    right -= SHELL_GAP;
+    width = l->symbols[SYMBOL_SETTINGS] ? SHELL_ICON - 4 : 0;
+    right -= width;
+
+    /* Where the pill is going, before anything is drawn over it. */
+    {
+        int target_x = 0, target_w = 0, at = SHELL_MARGIN;
+
+        for (i = SHELL_HOME; i <= SHELL_LIBRARY; i++)
+        {
+            int item_w = shell_width( l, i );
+
+            if (l->zone == ZONE_HEADER && l->header_focus == i)
+            {
+                target_x = at - SHELL_PADDING;
+                target_w = item_w + 2 * SHELL_PADDING;
+            }
+            at += item_w + SHELL_GAP;
+        }
+        if (l->zone == ZONE_HEADER && l->header_focus == SHELL_SETTINGS)
+        {
+            target_x = right - SHELL_PADDING;
+            target_w = width + 2 * SHELL_PADDING;
+        }
+        if (!target_w) l->pill_w = 0;      /* focus left the header; it starts again where it returns */
+        else
+        {
+            if (!ui->animations || l->pill_w <= 0)
+            {
+                l->pill_x = target_x;
+                l->pill_w = target_w;
+            }
+            else
+            {
+                l->pill_x += (target_x - l->pill_x) * 0.30f;
+                l->pill_w += (target_w - l->pill_w) * 0.30f;
+            }
+            ui_animated_border( ui, (int)(l->pill_x + 0.5f), SHELL_Y - 24, (int)(l->pill_w + 0.5f), 48,
+                                14, 2, (SDL_Color){ 150, 160, 176, 90 },
+                                (SDL_Color){ 244, 247, 250, 255 } );
+        }
+    }
+    for (i = SHELL_HOME; i <= SHELL_LIBRARY; i++)
+    {
+        int focused = l->zone == ZONE_HEADER && l->header_focus == i;
+        float lit = focused ? 1.0f : l->label_open[i];
+        int start = x;
+
+        x += draw_symbol( l, tabs[i].symbol, x, SHELL_Y, 150 + (int)(105 * lit) );
+        if (tabs[i].label && l->label_open[i] > 0.01f)
+        {
+            x += (int)(12 * l->label_open[i] + 0.5f);
+            ui_text_opening( ui, ui->normal, x, SHELL_Y - TTF_FontHeight( ui->normal ) / 2, tabs[i].label,
+                             ui->value, l->label_open[i] );
+            x += (int)(ui_text_width( ui, ui->normal, tabs[i].label ) * l->label_open[i] + 0.5f);
+        }
+        l->shell_hits[i] = (SDL_Rect){ start - SHELL_GAP / 2, 0, x - start + SHELL_GAP, UI_HEADER_HEIGHT };
+        x += SHELL_GAP;
+    }
+
+    draw_symbol( l, SYMBOL_SETTINGS, right, SHELL_Y,
+                 l->zone == ZONE_HEADER && l->header_focus == SHELL_SETTINGS ? 255 : 190 );
+    l->shell_hits[SHELL_SETTINGS] = (SDL_Rect){ right - SHELL_GAP / 2, 0, width + SHELL_GAP, UI_HEADER_HEIGHT };
+    if (home) draw_footprint( l );
+}
+
+/* Launcher mark on Home and settings screens. */
+static void draw_footprint( struct launcher *l )
+{
+    struct ui *ui = &l->ui;
+    const int line = HOME_HINT_Y - 12;
+    int height = 44, x = SHELL_MARGIN, width, h;
+
+    if (l->logo)
+    {
+        SDL_Rect rect;
+
+        SDL_QueryTexture( l->logo, NULL, NULL, &width, &h );
+        rect.h = height;
+        rect.w = h ? width * height / h : height;
+        rect.x = x;
+        rect.y = line - height / 2;
+        SDL_RenderCopy( ui->renderer, l->logo, NULL, &rect );
+    }
+}
+
+/* What the settings screens ask for through the ui. */
+static void footer_mark( void *data )
+{
+    draw_footprint( data );
+}
+
+static SDL_Rect cover_crop( const struct program *p, int width, int height )
+{
+    SDL_Rect src = {0, 0, p->icon_width, p->icon_height};
+    if (src.w * height > src.h * width)
+    {
+        src.w = src.h * width / height;
+        src.x = (p->icon_width - src.w) / 2;
+    }
+    else
+    {
+        src.h = src.w * height / width;
+        src.y = (p->icon_height - src.h) / 2;
+    }
+    return src;
+}
+
+static void draw_cover( struct ui *ui, const struct program *p, SDL_Rect rect, int radius, int brightness, int alpha )
+{
+    SDL_Rect src = cover_crop( p, rect.w, rect.h );
+
+    ui_rounded_texture( ui, p->icon, &src, rect, radius, (SDL_Color){ brightness, brightness, brightness, alpha } );
+}
+
+/* Whether a game's backdrop can be drawn as it will stay: its hero art, or,
+ * when it has none, its portrait art or nothing -- not something shown for a
+ * moment and replaced. */
+static int backdrop_ready( struct launcher *l, int index )
+{
+    struct program *p;
+
+    if (index < 0 || !l->thread) return 1;
+    p = &l->programs[index];
+    request_art( l, index, ART_HERO );
+    if (p->hero_icon) return 1;
+    if (p->hero_state != ICON_MISSING) return 0;
+    request_icon( l, index );
+    return p->icon_state == ICON_READY || p->icon_state == ICON_MISSING;
+}
+
+static void draw_backdrop_art( struct launcher *l, int index, int alpha )
+{
+    struct ui *ui = &l->ui;
+    struct program *p;
+    SDL_Rect src;
+
+    if (index < 0 || alpha <= 0) return;
+    p = &l->programs[index];
+    /* Asked for again so that the cache keeps what is on the screen. */
+    request_art( l, index, ART_HERO );
+    if (p->hero_icon)
+    {
+        int sw = p->hero_width, sh = p->hero_height;
+        src = (SDL_Rect){0, 0, sw, sh};
+        if ((long long)sw * ui->height > (long long)sh * ui->width)
+        { src.w = sh * ui->width / ui->height; src.x = (sw - src.w) / 2; }
+        else { src.h = sw * ui->height / ui->width; src.y = (sh - src.h) / 2; }
+        SDL_SetTextureColorMod( p->hero_icon, 205, 205, 205 );
+        SDL_SetTextureAlphaMod( p->hero_icon, alpha );
+        SDL_SetTextureScaleMode( p->hero_icon, SDL_ScaleModeLinear );
+        SDL_RenderCopy( ui->renderer, p->hero_icon, &src, NULL );
+    }
+    else if (p->hero_state == ICON_MISSING)
+    {
+        request_icon( l, index );
+        if (!p->icon || !p->icon_is_art) return;
+        src = cover_crop( p, ui->width, ui->height );
+        SDL_SetTextureColorMod( p->icon, 205, 205, 205 );
+        SDL_SetTextureAlphaMod( p->icon, alpha );
+        SDL_SetTextureScaleMode( p->icon, SDL_ScaleModeLinear );
+        SDL_RenderCopy( ui->renderer, p->icon, &src, NULL );
+    }
+}
+
+/* The focused game's artwork behind the whole screen, shaded toward the left and
+ * the bottom where the text sits. The last game's stays until the new one's is
+ * decoded, and the two are crossfaded from then: moving along a row never
+ * shows the screen bare between them. */
+static void draw_backdrop( struct launcher *l, int current )
+{
+    struct ui *ui = &l->ui;
+    Uint32 now = SDL_GetTicks();
+    int alpha = 255;
+
+    ui_background( ui );
+    if (current != l->backdrop && backdrop_ready( l, current ))
+    {
+        l->backdrop_previous = l->backdrop;
+        l->backdrop = current;
+        l->backdrop_since = now;
+    }
+    if (ui->animations && now - l->backdrop_since < BACKDROP_FADE_MS)
+        alpha = 255 * (int)(now - l->backdrop_since) / BACKDROP_FADE_MS;
+    else l->backdrop_previous = -1;
+    draw_backdrop_art( l, l->backdrop_previous, 255 );
+    draw_backdrop_art( l, l->backdrop, alpha );
+
+    ui_fill( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 0, 0, 0, 30 } );
+    ui_gradient( ui, 0, 0, ui->width * 2 / 3, ui->height, (SDL_Color){ 0, 0, 0, 130 }, (SDL_Color){ 0, 0, 0, 0 }, 1 );
+    ui_gradient( ui, 0, ui->height / 2, ui->width, ui->height - ui->height / 2,
+                 (SDL_Color){ 0, 0, 0, 0 }, (SDL_Color){ 0, 0, 0, 215 }, 0 );
+}
+
+/* Where a cover sits. offset is the row's scroll in covers, focus how focused
+ * this one is (0-1): focused covers are larger and push the rest along. */
+static SDL_Rect carousel_rect( float slot, float focus )
+{
+    float expansion = slot < 0 ? 0 : slot > 1 ? 1 : slot;
+
+    return (SDL_Rect){ SHELL_MARGIN + (int)lroundf( slot * (HOME_CARD_W + HOME_CARD_GAP) +
+                                                    expansion * (HOME_FOCUS_W + HOME_FOCUS_GAP - HOME_CARD_W - HOME_CARD_GAP) ),
+                       HOME_TOP, HOME_CARD_W + (int)lroundf( (HOME_FOCUS_W - HOME_CARD_W) * focus ),
+                       HOME_CARD_H + (int)lroundf( (HOME_FOCUS_H - HOME_CARD_H) * focus ) };
+}
+
+static void draw_carousel_card( struct launcher *l, int index, SDL_Rect rect, float focus )
+{
+    struct ui *ui = &l->ui;
+    struct program *p = &l->programs[l->history[index]];
+    int x = rect.x, y = rect.y, w = rect.w, h = rect.h;
+    int target = w / 2, cx = x + w / 2, cy = y + h / 2, shade = 170 + (int)(85 * focus);
+
+    request_icon( l, l->history[index] );
+    if (focus > 0 && l->zone != ZONE_HEADER)
+    {
+        /* A soft light behind the focused cover, and a thin bright edge around
+         * it -- while the games have the focus. The header takes it away. */
+        int strength = (int)(focus * 255);
+
+        if (ui->glow)
+        {
+            SDL_Rect glow = { x - w / 3, y - h / 4, w + w * 2 / 3, h + h / 2 };
+            SDL_SetTextureColorMod( ui->glow, 255, 255, 255 );
+            SDL_SetTextureAlphaMod( ui->glow, strength * 40 / 255 );
+            SDL_RenderCopy( ui->renderer, ui->glow, NULL, &glow );
+        }
+        /* The light that goes round what has the focus, coming up as the cover
+         * comes into the middle. */
+        ui_animated_border( ui, x - 3, y - 3, w + 6, h + 6, HOME_RADIUS + 3, 3,
+                            (SDL_Color){ 150, 160, 176, strength * 90 / 255 },
+                            (SDL_Color){ 244, 247, 250, strength } );
+    }
+    ui_rounded( ui, x, y, w, h, HOME_RADIUS, (SDL_Color){ 30, 33, 36, 255 } );
+    if (p->icon && p->icon_is_art)
+        draw_cover( ui, p, rect, HOME_RADIUS, 225 + (int)(30 * focus), fade_in( ui, p->icon_time ) );
+    /* Until it is known what the card shows, it shows its bare surface, not a
+     * drawn picture and a title that the art would then replace. */
+    else if (p->icon || p->icon_state == ICON_MISSING)
+    {
+        if (p->icon)
+        {
+            int side = p->icon_width > p->icon_height ? p->icon_width : p->icon_height;
+            int iw = p->icon_width * target / side, ih = p->icon_height * target / side;
+            SDL_Rect dst = { cx - iw / 2, cy - ih / 2 - 5, iw, ih };
+            SDL_SetTextureScaleMode( p->icon, SDL_ScaleModeLinear );
+            SDL_SetTextureColorMod( p->icon, shade, shade, shade );
+            SDL_SetTextureAlphaMod( p->icon, fade_in( ui, p->icon_time ) );
+            SDL_RenderCopy( ui->renderer, p->icon, NULL, &dst );
+        }
+        else draw_placeholder( l, p, cx, cy - 5, target, shade );
+        ui->verbatim_text = 1;
+        ui_text_wrapped( ui, ui->small, cx, y + h - 66, w - 24, 2, p->title, ui->text, 1 );
+        ui->verbatim_text = 0;
+    }
+    /* The gloss over the cover: brightest along its top edge, gone lower down. */
+    if (focus > 0)
+        ui_rounded_texture( ui, ui_sheen( ui ), NULL, rect, HOME_RADIUS,
+                            (SDL_Color){ 255, 255, 255, (int)(38 * focus) } );
+    if (p->missing)
+    {
+        int badge_h = TTF_FontHeight( ui->small ) + 8;
+        int badge_w = ui_text_width( ui, ui->small, "Missing" ) + 20;
+
+        ui_rounded( ui, x + 12, y + 12, badge_w, badge_h, badge_h / 2,
+                    (SDL_Color){ 120, 28, 32, 230 } );
+        ui_text( ui, ui->small, x + 22, y + 12 + (badge_h - TTF_FontHeight( ui->small )) / 2,
+                 "Missing", ui->value );
+    }
+}
+
+static int carousel_hit( const struct launcher *l, int x, int y )
+{
+    SDL_Point point = {x, y};
+    int i;
+    if (l->history_count && SDL_PointInRect( &point, &l->carousel_hits[l->history_selection] ))
+        return l->history_selection;
+    for (i = 0; i < l->history_count; i++)
+        if (SDL_PointInRect( &point, &l->carousel_hits[i] )) return i;
+    return -1;
+}
+
+/* A label in a rounded outline beside the title; returns its width. */
+static int draw_tag( struct ui *ui, int x, int cy, const char *text, int warning )
+{
+    const int h = 30, w = ui_text_width( ui, ui->small, text ) + 26;
+
+    ui_rounded( ui, x, cy - h / 2, w, h, h / 2, warning ? (SDL_Color){ 196, 64, 68, 255 } : (SDL_Color){ 255, 255, 255, 64 } );
+    ui_rounded( ui, x + 1, cy - h / 2 + 1, w - 2, h - 2, h / 2 - 1,
+                warning ? (SDL_Color){ 120, 28, 32, 235 } : (SDL_Color){ 12, 14, 16, 150 } );
+    ui_text( ui, ui->small, x + 13, cy - TTF_FontHeight( ui->small ) / 2, text, ui->value );
+    return w;
+}
+
+static void draw_home( struct launcher *l )
+{
+    struct ui_hint hints[] = { { UI_A, "Play" }, { UI_Y, "Options" }, { UI_PLUS, "Menu" } };
+    static const struct ui_hint empty_hints[] = { { UI_A, "Open Library" } };
+    struct ui *ui = &l->ui;
+    int i;
+    Uint32 now = SDL_GetTicks();
+
+    if (!l->carousel_started || !ui->animations)
+        l->carousel_position = l->history_selection;
+    else
+    {
+        float dt = (now - l->carousel_tick) / 1000.0f;
+        if (dt > 0.05f) dt = 0.05f;
+        l->carousel_position += (l->history_selection - l->carousel_position) * (1 - expf( -18 * dt ));
+        if (fabsf( l->history_selection - l->carousel_position ) < 0.002f) l->carousel_position = l->history_selection;
+    }
+    l->carousel_started = 1;
+    l->carousel_tick = now;
+    memset( l->carousel_hits, 0, sizeof(l->carousel_hits) );
+    memset( &l->add_hit, 0, sizeof(l->add_hit) );
+
+    /* The backdrops a step or two along the row, before this one's: ready by
+     * the time the selection gets there. */
+    for (i = 2; i >= 1; i--)
+    {
+        if (l->history_selection + i < l->history_count) request_art( l, l->history[l->history_selection + i], ART_HERO );
+        if (l->history_selection - i >= 0) request_art( l, l->history[l->history_selection - i], ART_HERO );
+    }
+    draw_backdrop( l, l->history_count ? l->history[l->history_selection] : -1 );
+    draw_shell( l, 1 );
+    if (!l->history_count)
+    {
+        const SDL_Rect open = { (ui->width - 260) / 2, 420, 260, 60 };
+
+        ui_text_centered( ui, ui->large, ui->width / 2, 250, "Nothing played yet", ui->value );
+        ui_text_wrapped( ui, ui->normal, ui->width / 2, 320, 760, 2,
+                         "Games you start appear here, the most recent first. Open your library to choose one.",
+                         ui->dim, 1 );
+        ui_rounded( ui, open.x, open.y, open.w, open.h, 20, (SDL_Color){ 242, 244, 246, 255 } );
+        ui_text_centered( ui, ui->normal, ui->width / 2, open.y + (open.h - TTF_FontHeight( ui->normal )) / 2,
+                          "Open Library", (SDL_Color){ 18, 20, 24, 255 } );
+        l->add_hit = open;
+        ui_hints_right( ui, empty_hints, 1, ui->width - SHELL_MARGIN, HOME_HINT_Y );
+    }
+    else
+    {
+        struct program *p = &l->programs[l->history[l->history_selection]];
+        const SDL_Rect viewport = { 0, HOME_TOP - 60, ui->width, HOME_FOCUS_H + 120 };
+        /* The focus stays where it is and the covers slide through it. */
+        float offset = l->carousel_position;
+        SDL_Rect focused_rect = {0};
+        int title_x, focused_drawn = 0;
+
+        SDL_RenderSetClipRect( ui->renderer, &viewport );
+        for (i = 0; i <= l->history_count; i++)
+        {
+            /* The focused cover last, so its light falls over its neighbours. */
+            int index = i == l->history_count ? l->history_selection : i;
+            float slot = index - offset, closeness = 1 - fabsf( index - l->carousel_position );
+            float focus = closeness < 0 ? 0 : closeness;
+            SDL_Rect rect = carousel_rect( slot, focus );
+
+            if (i < l->history_count && index == l->history_selection) continue;
+            if (rect.x >= ui->width || rect.x + rect.w <= 0) continue;
+            SDL_IntersectRect( &rect, &viewport, &l->carousel_hits[index] );
+            if (i == l->history_count)
+            {
+                focused_rect = rect;
+                focused_drawn = 1;
+            }
+            draw_carousel_card( l, index, rect, focus );
+        }
+        SDL_RenderSetClipRect( ui->renderer, NULL );
+
+        title_x = focused_drawn ? focused_rect.x + focused_rect.w + HOME_FOCUS_GAP
+                                : SHELL_MARGIN + HOME_FOCUS_W + HOME_FOCUS_GAP;
+        ui->verbatim_text = 1;
+        ui_text_fit( ui, ui->normal, title_x, HOME_TITLE_Y, ui->width - SHELL_MARGIN - title_x - 120, p->title,
+                     ui->value, 1 );
+        ui->verbatim_text = 0;
+        if (p->missing)
+            draw_tag( ui, title_x, HOME_TITLE_Y + TTF_FontHeight( ui->normal ) + 20, "Missing", 1 );
+
+        if (l->zone == ZONE_HEADER) hints[0].label = "Select";
+        ui_hints_right( ui, hints, 3, ui->width - SHELL_MARGIN, HOME_HINT_Y );
+    }
+    ui_fade( ui );
+}
+
+/***********************************************************************
+ * A program's menu
+ */
+
+enum program_row
+{
+    ROW_START, ROW_FAVORITE, ROW_ARTWORK, ROW_FORWARDER, ROW_LOCATE, ROW_TITLE, ROW_ARGS, ROW_VERBOSE, ROW_PROFILE,
+    ROW_WINDOWS, ROW_D3D9, ROW_VKD3D_VERSION, ROW_DXVK_VERSION, ROW_DXVK_OPTIONS, ROW_DXVK_HUD, ROW_FRAME_LIMIT, ROW_VSYNC,
+    ROW_LSFG, ROW_LSFG_DLL, ROW_LSFG_PERFORMANCE, ROW_LSFG_FLOW,
+    ROW_UPSCALING, ROW_UPSCALING_SHARPNESS,
+    ROW_INPUT, ROW_INPUT_END = ROW_INPUT + INPUT_ROW_COUNT - 1, ROW_BOX64, ROW_FEX, ROW_SYNC, ROW_CPU, ROW_FOUR_CORES, ROW_LAZY_FILE_VIEWS,
+    ROW_HIDE, ROW_LIBRARY, ROW_GAME_FIX, PROGRAM_ROWS
+};
+
+static int file_browser_pick( struct launcher *l, char *target, size_t size );
+static int pick_forwarder_icon( void *opaque, char *target, size_t size );
+static void save_look( struct launcher *l );
+
+static void quick_setup( struct launcher *l )
+{
+    int result = launcher_setup_run( &l->ui, l->options, l->logo, l->dlls );
+    launcher_kv_set( &l->look, "setup-offered", "1" );
+    if (result) launcher_kv_set( &l->look, "setup-complete", "1" );
+    save_look( l );
+    if (result == 2)
+    {
+        l->options->reboot_requested = 1;
+        l->ui.running = 0;
+    }
+}
+
+static void offer_quick_setup( struct launcher *l )
+{
+    const struct setup_boot_manifest *manifest;
+    char bundle_id[33], prompted[33] = "";
+    if (!l->options->install_forwarder) return;
+    if (!launcher_kv_get_int( &l->look, "setup-offered", 0 ))
+    {
+        quick_setup( l );
+        return;
+    }
+    manifest = setup_boot_bundled_manifest();
+    if (!setup_boot_needs_update( "sdmc:", manifest, NULL )) return;
+    setup_boot_bundle_id( manifest, bundle_id );
+    launcher_kv_get( &l->look, "setup-boot-prompted", prompted, sizeof(prompted) );
+    if (!strcmp( prompted, bundle_id )) return;
+    launcher_kv_set( &l->look, "setup-boot-prompted", bundle_id );
+    save_look( l );
+    quick_setup( l );
+}
+
+static int confirm_forwarder( struct launcher *l )
+{
+    struct ui *ui = &l->ui;
+    char message[320];
+
+    snprintf( message, sizeof(message),
+              "A forwarder is installed as an application. Consoles have been banned for homebrew "
+              "in that list.\n\nUse emuMMC only. %s",
+              l->options->emummc > 0 ? "This console is on emuMMC." :
+              l->options->emummc == 0 ? "This console is NOT on emuMMC." :
+              "Atmosphere did not say which this console is on." );
+    return ui_confirm( ui, "Install forwarder", message, "Install" );
+}
+
+static void make_forwarder( struct launcher *l )
+{
+    struct ui *ui = &l->ui;
+    const char *step = NULL;
+    char message[256];
+    unsigned int rc;
+
+    if (!l->options->install_forwarder) return;
+    if (!confirm_forwarder( l )) { ui_start_screen( ui ); return; }
+
+    /* One frame saying what is happening: building the three parts and writing
+     * them takes a moment, and nothing is drawn while it does. */
+    ui_start_screen( ui );
+    ui_background( ui );
+    ui_header_back( ui, "Install forwarder", "Autorun" );
+    ui_text_centered( ui, ui->large, ui->width / 2, ui->height / 2 - 30, "Installing...", ui->value );
+    ui_present( ui );
+
+    rc = l->options->install_forwarder( &step );
+    ui_start_screen( ui );
+    if (rc)
+    {
+        snprintf( message, sizeof(message), "The console refused while %s.\n\nResult 0x%X.",
+                  step ? step : "working", rc );
+        ui_message( ui, "Could not install", message );
+        ui_start_screen( ui );
+        return;
+    }
+    ui_message( ui, "Installed", "Autorun is on the home menu." );
+    ui_start_screen( ui );
+}
+
+
+static char *artwork_path( struct program *p, enum steamgriddb_kind kind )
+{
+    return kind == STEAMGRIDDB_ICON ? p->square_art : kind == STEAMGRIDDB_COVER ? p->portrait_art : p->hero_art;
+}
+
+static int artwork_installed( struct program *p, enum steamgriddb_kind kind )
+{
+    char folder[512], sibling[512];
+    const char *path = artwork_path( p, kind );
+    if (file_exists( path )) return 1;
+    if (kind != STEAMGRIDDB_COVER || path[0]) return 0;
+    snprintf( folder, sizeof(folder), "%s", p->path );
+    parent_dir( folder );
+    if (snprintf( sibling, sizeof(sibling), "%s/cover.png", folder ) >= (int)sizeof(sibling)) return 0;
+    return file_exists( sibling );
+}
+
+static int artwork_key( struct launcher *l, char *key, size_t size )
+{
+    key[0] = 0;
+    launcher_kv_get( &l->look, "steamgriddb-key", key, size );
+    if (key[0]) return 1;
+    if (!launcher_platform_prompt( "SteamGridDB API key", "", key, size ) || !key[0]) return 0;
+    launcher_kv_set( &l->look, "steamgriddb-key", key );
+    save_look( l );
+    return 1;
+}
+
+static int artwork_directory( struct launcher *l, char *folder, size_t size )
+{
+    if (snprintf( folder, size, "%s/artwork", l->options->runtime_dir ) >= (int)size) return 0;
+    if (!mkdir( folder, 0777 ) || errno == EEXIST) return 1;
+    ui_message( &l->ui, "Artwork", "The artwork cache directory could not be created." );
+    return 0;
+}
+
+static int artwork_destinations( struct launcher *l, struct program *p, const char *folder, char paths[3][512] )
+{
+    static const char *const suffixes[] = { "square", "portrait", "hero" };
+    int kind;
+    if (!p->catalog_id) p->catalog_id = l->catalog.next_id++;
+    for (kind = 0; kind < 3; kind++)
+        if (snprintf( paths[kind], sizeof(paths[kind]), "%s/%u-%s.png", folder, p->catalog_id, suffixes[kind] ) >=
+            (int)sizeof(paths[kind])) return 0;
+    return 1;
+}
+
+static void set_artwork( struct program *p, enum steamgriddb_kind kind, const char *path )
+{
+    enum art_kind surface = kind == STEAMGRIDDB_ICON ? ART_SQUARE : kind == STEAMGRIDDB_COVER ? ART_PORTRAIT : ART_HERO;
+    struct art art = art_of( p, surface );
+    snprintf( artwork_path( p, kind ), 512, "%s", path );
+    p->added = 1;
+    p->art_generation[surface]++;
+    SDL_DestroyTexture( *art.texture );
+    *art.texture = NULL;
+    *art.state = ICON_UNKNOWN;
+    if (surface == ART_PORTRAIT) p->icon_is_art = 0;
+}
+
+static void download_artwork( struct launcher *l, struct program *p )
+{
+    const char *const labels[] = { "Icon", "Cover", "Background" };
+    char key[512], folder[512], paths[3][512];
+    long id;
+    int kind = 0;
+    if (!artwork_key( l, key, sizeof(key) ) || !artwork_directory( l, folder, sizeof(folder) )) return;
+    id = launcher_artwork_search( &l->ui, key, p->title );
+    if (!id || !artwork_destinations( l, p, folder, paths )) return;
+    while (l->ui.running)
+    {
+        kind = ui_menu( &l->ui, "Download artwork", labels, 3, kind );
+        if (kind < 0) break;
+        if (launcher_artwork_pick( &l->ui, key, id, kind, paths[kind], NULL ))
+        {
+            set_artwork( p, kind, paths[kind] );
+            save_library( l );
+            ui_toast( &l->ui, "Artwork saved", 2000 );
+        }
+    }
+}
+
+static void download_all_covers( struct launcher *l )
+{
+    struct launcher_artwork_entry *entries;
+    char key[512], folder[512];
+    int i, kind, pending = 0, changed = 0;
+    if (!l->program_count) { ui_toast( &l->ui, "The library is empty", 2000 ); return; }
+    if (!artwork_key( l, key, sizeof(key) ) || !artwork_directory( l, folder, sizeof(folder) )) return;
+    entries = calloc( l->program_count, sizeof(*entries) );
+    if (!entries) { ui_message( &l->ui, "Artwork", "Not enough memory to start the download." ); return; }
+    for (i = 0; i < l->program_count; i++)
+    {
+        struct program *p = &l->programs[i];
+        if (p->removed) continue;
+        for (kind = 0; kind < 3; kind++)
+            if (!artwork_installed( p, kind )) entries[i].missing |= 1u << kind;
+        if (!entries[i].missing) continue;
+        if (!artwork_destinations( l, p, folder, entries[i].paths )) { free( entries ); return; }
+        snprintf( entries[i].title, sizeof(entries[i].title), "%s", p->title );
+        pending++;
+    }
+    if (pending)
+    {
+        launcher_artwork_download_all( &l->ui, key, entries, l->program_count );
+        for (i = 0; i < l->program_count; i++)
+            for (kind = 0; kind < 3; kind++)
+                if (entries[i].downloaded & (1u << kind))
+                { set_artwork( &l->programs[i], kind, entries[i].paths[kind] ); changed = 1; }
+        if (changed) save_library( l );
+    }
+    else ui_toast( &l->ui, "All artwork is already installed", 2400 );
+    free( entries );
+}
+
+/* A setting that follows the global one (-1) or is on (1) or off (0) for this program. */
+static const char *state_text( int state, int global, const char *on, const char *off, char *buffer, size_t size )
+{
+    if (state >= 0) return state ? on : off;
+    snprintf( buffer, size, "Global (%s)", global ? on : off );
+    return buffer;
+}
+
+static int next_state( int state, int direction )
+{
+    static const int order[3] = { -1, 1, 0 };
+    int i;
+
+    for (i = 0; i < 2 && order[i] != state; i++) {}
+    return order[(i + (direction < 0 ? 2 : 1)) % 3];
+}
+
+static int address_space_fits( struct launcher *l, struct program *p )
+{
+    return l->options->address_space_bits == 39 &&
+           (l->options->low_window || launcher_program_address_space( p->path ) != LAUNCHER_ADDRESS_LOW);
+}
+
+static int prepare_program_graphics( struct launcher *l, struct program *p )
+{
+    char dxvk[32], vkd3d[32];
+
+    strcpy( dxvk, p->settings.dxvk_version );
+    strcpy( vkd3d, p->settings.vkd3d_version );
+    if (!launcher_graphics_ensure( l->graphics, p->machine,
+                                  p->settings.d3d == LAUNCHER_D3D_DXVK_VKD3D,
+                                  p->settings.dxvk_source, dxvk, vkd3d )) return 0;
+    strcpy( p->settings.dxvk_version, dxvk );
+    strcpy( p->settings.vkd3d_version, vkd3d );
+    return 1;
+}
+
+
+static int start_program( struct launcher *l, struct program *p, char *target, size_t size )
+{
+    struct ui *ui = &l->ui;
+    char path[512], setup[640];
+    enum launcher_fixes_start fix_start;
+    int api;
+
+    if (!file_exists( p->path ) || l->options->machine_of( p->path, &p->machine ))
+    {
+        p->missing = 1;
+        ui_message( ui, "Game unavailable", "The executable is missing or is not supported by this build." );
+        return 0;
+    }
+    if (!address_space_fits( l, p ))
+    {
+        ui_message( ui, "Address space unavailable", l->options->address_space_bits != 39
+                    ? "Start Autorun from its 39-bit forwarder. You can install it in Settings > System."
+                    : "This game requires the Atmosphere low-address patch. Restart with the patched loader and Mesosphere." );
+        return 0;
+    }
+    /* Autorun ships no Windows DLLs: a card without them is offered them here. */
+    if (!launcher_dlls_ready( l->dlls )) return 0;
+    /* A game with a fix in the game fixes repository is asked about it; one
+     * that was applied may have changed its settings, so they are read again. */
+    fix_start = launcher_fixes_before_start( l->fixes, p->title, p->path, setup, sizeof(setup) );
+    if (fix_start == LAUNCHER_FIXES_CANCEL) return 0;
+    if (fix_start == LAUNCHER_FIXES_APPLIED || fix_start == LAUNCHER_FIXES_SETUP) load_program_settings( l, p );
+    api = game_settings_d3d_api( l->options->runtime_dir, p->path, p->machine );
+    if (api < 0)
+    {
+        ui_message( ui, "Game Settings", "The game's configuration could not be read." );
+        return 0;
+    }
+    if (api && (p->settings.d3d != (api == 11 ? LAUNCHER_D3D_DXVK : LAUNCHER_D3D_DXVK_VKD3D) ||
+                (api == 12 && p->settings.dxvk_source == DXVK_SOURCE_SAREK)))
+    {
+        p->settings.d3d = api == 11 ? LAUNCHER_D3D_DXVK : LAUNCHER_D3D_DXVK_VKD3D;
+        if (api == 12 && p->settings.dxvk_source == DXVK_SOURCE_SAREK)
+        {
+            p->settings.dxvk_source = DXVK_SOURCE_OFFICIAL;
+            p->settings.dxvk_version[0] = 0;
+        }
+        save_program_settings( l, p );
+        if (p->settings.d3d != (api == 11 ? LAUNCHER_D3D_DXVK : LAUNCHER_D3D_DXVK_VKD3D) ||
+            (api == 12 && p->settings.dxvk_source == DXVK_SOURCE_SAREK)) return 0;
+    }
+    if (p->settings.d3d != LAUNCHER_D3D_WINE && !prepare_program_graphics( l, p )) return 0;
+    p->missing = 0;
+    p->launched_order = l->catalog.next_order++;
+    save_library( l );
+
+    ui_background( ui );
+    ui_text_centered( ui, ui->large, ui->width / 2, (ui->height - TTF_FontHeight( ui->large )) / 2,
+                      "Starting game...", ui->value );
+    ui->hide_overlays = 1;
+    ui_present( ui );
+
+    snprintf( target, size, "%s", p->path );
+    runtime_file( l, "target.txt", path, sizeof(path) );
+    write_line( path, target );
+    /* The fix's setup goes first, and the game after it from run-next.txt,
+     * when this runtime can start itself again. */
+    if (fix_start == LAUNCHER_FIXES_SETUP)
+    {
+        runtime_file( l, "run-next.txt", path, sizeof(path) );
+        if (!l->options->schedule_restart || !write_line( path, p->path ))
+            ui_message( ui, "Game fix", "The fix's setup runs now. Start the game again once it has finished." );
+        snprintf( target, size, "%s", setup );
+    }
+    return 1;
+}
+
+static void edit_text( const char *header, char *value, size_t size )
+{
+    char edited[896];
+
+    if (!launcher_platform_prompt( header, value, edited, size < sizeof(edited) ? size : sizeof(edited) )) return;
+    snprintf( value, size, "%s", edited );
+}
+
+static int box64_configured_count( const struct launcher_kv *kv, int advanced )
+{
+    char value[64];
+    int count = 0, i;
+
+    for (i = 0; i < NX_BOX64_OPTION_COUNT; i++)
+        if (nx_box64_options[i].advanced == advanced &&
+            launcher_kv_get( kv, nx_box64_options[i].name, value, sizeof(value) )) count++;
+    return count;
+}
+
+static void box64_options_status( const char *path, char *value, size_t size )
+{
+    struct launcher_kv kv;
+    int count;
+
+    if (!launcher_kv_load( &kv, path ))
+    {
+        snprintf( value, size, "File too large" );
+        return;
+    }
+    count = box64_configured_count( &kv, 0 ) + box64_configured_count( &kv, 1 );
+    if (count) snprintf( value, size, "%d flag%s set", count, count == 1 ? "" : "s" );
+    else if (file_exists( path )) snprintf( value, size, "Custom file" );
+    else snprintf( value, size, "Default" );
+}
+
+static int box64_option_value( const struct launcher_kv *kv, const struct nx_box64_option *option,
+                               long *value, char *text, size_t size )
+{
+    int choice;
+
+    if (!launcher_kv_get( kv, option->name, text, size ))
+    {
+        *value = option->default_value;
+        choice = nx_box64_option_choice( option, *value );
+        snprintf( text, size, "%s", option->value_names[choice] );
+        return choice;
+    }
+    if (!nx_box64_option_parse_value( text, value ) ||
+        (choice = nx_box64_option_choice( option, *value )) < 0)
+    {
+        char invalid[64];
+
+        snprintf( invalid, sizeof(invalid), "%s", text );
+        snprintf( text, size, "Unsupported (%s)", invalid );
+        return -1;
+    }
+    snprintf( text, size, "%s", option->value_names[choice] );
+    return choice;
+}
+
+static int box64_option_rows( struct ui_row *rows, int *ids, int count,
+                              const struct launcher_kv *kv, int advanced )
+{
+    int i;
+
+    for (i = 0; i < NX_BOX64_OPTION_COUNT; i++)
+    {
+        long value;
+
+        if (nx_box64_options[i].advanced != advanced) continue;
+        ids[count] = i;
+        snprintf( rows[count].label, sizeof(rows[count].label), "%s", nx_box64_options[i].name );
+        box64_option_value( kv, nx_box64_options + i, &value,
+                            rows[count].value, sizeof(rows[count].value) );
+        rows[count].help = nx_box64_options[i].help;
+        rows[count].kind = UI_ROW_VALUE;
+        rows[count].adjustable = 1;
+        count++;
+    }
+    return count;
+}
+
+static void box64_options_menu( struct launcher *l, struct program *p )
+{
+    struct ui_row rows[NX_BOX64_OPTION_COUNT + 1];
+    int ids[NX_BOX64_OPTION_COUNT + 1];
+    struct ui_list list = {0};
+    struct launcher_kv kv;
+    char path[520];
+    int count, expanded = 0, i;
+
+    if (!launcher_sibling_path( p->path, ".box64.txt", path, sizeof(path) ) ||
+        !launcher_kv_load( &kv, path ))
+    {
+        ui_message( &l->ui, "Box64 options", "The options file is too large to edit." );
+        return;
+    }
+    for (;;)
+    {
+        enum ui_action action;
+        int set;
+
+        memset( rows, 0, sizeof(rows) );
+        count = box64_option_rows( rows, ids, 0, &kv, 0 );
+        set = box64_configured_count( &kv, 1 );
+        ids[count] = -1;
+        snprintf( rows[count].label, sizeof(rows[count].label), "Advanced flags" );
+        snprintf( rows[count].value, sizeof(rows[count].value), expanded ? "Hide (%d set)" : "Show (%d set)", set );
+        rows[count].help = "Compatibility and lower-level DynaRec controls supported by Wine-NX's embedded Box64 backend.";
+        rows[count].kind = UI_ROW_DROPDOWN;
+        rows[count].on = expanded;
+        count++;
+        if (expanded) count = box64_option_rows( rows, ids, count, &kv, 1 );
+        action = ui_list_run( &l->ui, &list, "Box64 options", p->title, rows, count, 1 );
+        if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return;
+        i = ids[list.selection];
+        if (i < 0)
+        {
+            if (action == UI_ACTION_CHOOSE) expanded = !expanded;
+            continue;
+        }
+        else
+        {
+            const struct nx_box64_option *option = nx_box64_options + i;
+            char current_text[64], number[16];
+            long current_value;
+            int current = box64_option_value( &kv, option, &current_value,
+                                               current_text, sizeof(current_text) );
+            int next;
+
+            if (action == UI_ACTION_RESET) next = nx_box64_option_choice( option, option->default_value );
+            else
+            {
+                if (current < 0) current = nx_box64_option_choice( option, option->default_value );
+                next = (current + (action == UI_ACTION_LEFT ? option->value_count - 1 : 1)) % option->value_count;
+            }
+            snprintf( number, sizeof(number), "%d", option->values[next] );
+            if (!launcher_kv_set( &kv, option->name,
+                                  option->values[next] == option->default_value ? NULL : number ) ||
+                !launcher_kv_save( &kv, path ))
+            {
+                ui_message( &l->ui, "Box64 options", "The options could not be saved." );
+                if (!launcher_kv_load( &kv, path )) return;
+                continue;
+            }
+            load_program_settings( l, p );
+        }
+    }
+}
+
+static int fex_configured_count( const struct launcher_kv *kv, int advanced )
+{
+    char value[64];
+    int count = 0, i;
+
+    for (i = 0; i < NX_FEX_OPTION_COUNT; i++)
+        if (nx_fex_options[i].advanced == advanced &&
+            launcher_kv_get( kv, nx_fex_options[i].name, value, sizeof(value) )) count++;
+    return count;
+}
+
+static void fex_options_status( const char *path, char *value, size_t size )
+{
+    struct launcher_kv kv;
+    int count;
+
+    if (!launcher_kv_load( &kv, path ))
+    {
+        snprintf( value, size, "File too large" );
+        return;
+    }
+    count = fex_configured_count( &kv, 0 ) + fex_configured_count( &kv, 1 );
+    if (count) snprintf( value, size, "%d flag%s set", count, count == 1 ? "" : "s" );
+    else snprintf( value, size, "Default" );
+}
+
+static int fex_option_value( const struct launcher_kv *kv, const struct nx_fex_option *option,
+                             char *text, size_t size )
+{
+    char value[64];
+    int choice;
+
+    if (!launcher_kv_get( kv, option->name, value, sizeof(value) ))
+        choice = option->default_choice;
+    else if ((choice = nx_fex_option_choice( option, value )) < 0)
+    {
+        snprintf( text, size, "Unsupported (%s)", value );
+        return -1;
+    }
+    snprintf( text, size, "%s", option->value_names[choice] );
+    return choice;
+}
+
+static int fex_option_rows( struct ui_row *rows, int *ids, int count,
+                            const struct launcher_kv *kv, int advanced )
+{
+    int i;
+
+    for (i = 0; i < NX_FEX_OPTION_COUNT; i++)
+    {
+        if (nx_fex_options[i].advanced != advanced) continue;
+        ids[count] = i;
+        snprintf( rows[count].label, sizeof(rows[count].label), "%s", nx_fex_options[i].name );
+        fex_option_value( kv, nx_fex_options + i, rows[count].value, sizeof(rows[count].value) );
+        rows[count].help = nx_fex_options[i].help;
+        rows[count].kind = UI_ROW_VALUE;
+        rows[count].adjustable = 1;
+        count++;
+    }
+    return count;
+}
+
+static void fex_options_menu( struct launcher *l, struct program *p )
+{
+    struct ui_row rows[NX_FEX_OPTION_COUNT + 1];
+    int ids[NX_FEX_OPTION_COUNT + 1];
+    struct ui_list list = {0};
+    struct launcher_kv kv;
+    char path[768];
+    int count, expanded = 0, i;
+
+    if (!launcher_program_settings_path( l->options->runtime_dir, p->path, path, sizeof(path) ) ||
+        !launcher_kv_load( &kv, path ))
+    {
+        ui_message( &l->ui, "FEX options", "The program settings file is too large to edit." );
+        return;
+    }
+    for (;;)
+    {
+        const struct nx_fex_option *option;
+        enum ui_action action;
+        char current_text[64];
+        int current, next, set;
+
+        memset( rows, 0, sizeof(rows) );
+        count = fex_option_rows( rows, ids, 0, &kv, 0 );
+        set = fex_configured_count( &kv, 1 );
+        ids[count] = -1;
+        snprintf( rows[count].label, sizeof(rows[count].label), "Advanced flags" );
+        snprintf( rows[count].value, sizeof(rows[count].value), expanded ? "Hide (%d set)" : "Show (%d set)", set );
+        rows[count].help = "Lower-level performance and compatibility controls supported by Autorun's FEX backend.";
+        rows[count].kind = UI_ROW_DROPDOWN;
+        rows[count].on = expanded;
+        count++;
+        if (expanded) count = fex_option_rows( rows, ids, count, &kv, 1 );
+        action = ui_list_run( &l->ui, &list, "FEX options", p->title, rows, count, 1 );
+        if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return;
+        i = ids[list.selection];
+        if (i < 0)
+        {
+            if (action == UI_ACTION_CHOOSE) expanded = !expanded;
+            continue;
+        }
+        option = nx_fex_options + i;
+        current = fex_option_value( &kv, option, current_text, sizeof(current_text) );
+        if (action == UI_ACTION_RESET) next = option->default_choice;
+        else
+        {
+            if (current < 0) current = option->default_choice;
+            next = (current + (action == UI_ACTION_LEFT ? option->value_count - 1 : 1)) % option->value_count;
+        }
+        if (!launcher_kv_set( &kv, option->name,
+                              next == option->default_choice ? NULL : option->values[next] ) ||
+            !launcher_kv_save( &kv, path ))
+        {
+            ui_message( &l->ui, "FEX options", "The options could not be saved." );
+            if (!launcher_kv_load( &kv, path )) return;
+            continue;
+        }
+        load_program_settings( l, p );
+    }
+}
+
+/* Returns 1 when the program is to be started. */
+/* The sections of Game Settings, in the order they stand in the list. */
+enum program_section
+{
+    SECTION_GENERAL,
+    SECTION_EMULATION,
+    SECTION_GRAPHICS,
+    SECTION_CONTROLS,
+#ifdef WINE_NX_LSFG
+    SECTION_FRAME_GENERATION,
+#endif
+    SECTION_DIAGNOSTICS,
+    SECTION_LIBRARY,
+    SECTION_GAME
+};
+
+static int program_menu_run( struct launcher *l, struct program *p, char *target, size_t size,
+                             struct launcher_game_settings *game )
+{
+    static const char *const sections[] = { "General", "Emulation", "Graphics", "Controls",
+#ifdef WINE_NX_LSFG
+                                            "Frame Generation",
+#endif
+                                            "Diagnostics", "Library", "Game Settings" };
+    /* Kept between openings, so a game returns to the section it was left in. */
+    static int section;
+    struct ui_row rows[PROGRAM_ROWS + GAME_SETTINGS_MAX_ROWS];
+    int ids[PROGRAM_ROWS + GAME_SETTINGS_MAX_ROWS], count, id, i;
+    struct ui_list list = {0};
+    struct ui *ui = &l->ui;
+    char path[520], dir[512], line[896], global_line[896], name[128], buffer[64], fix_summary[640];
+    struct program copy;
+
+    for (;;)
+    {
+        const char *base = file_name( p->path );
+        int in_library = find_program( l, p->path ) >= 0;
+        int x86 = p->machine == 0x014c, x64 = p->machine == 0x8664, dxvk_beside, dxvk_ready;
+        struct dxvk_version dxvk, vkd3d;
+#ifdef WINE_NX_LSFG
+        int lsfg_installed;
+#endif
+        enum ui_action action;
+        struct ui_row *row;
+
+        snprintf( name, sizeof(name), "%.*s", (int)(strlen( base ) > 4 ? strlen( base ) - 4 : strlen( base )), base );
+        snprintf( dir, sizeof(dir), "%s", p->path );
+        parent_dir( dir );
+        snprintf( path, sizeof(path), "%s/%s", dir, x64 ? "d3d11.dll" : "d3d9.dll" );
+        dxvk_beside = file_exists( path );
+        if (x64)
+        {
+            snprintf( path, sizeof(path), "%s/dxgi.dll", dir );
+            dxvk_beside |= file_exists( path );
+            if (p->settings.d3d == LAUNCHER_D3D_DXVK_VKD3D)
+            {
+                snprintf( path, sizeof(path), "%s/d3d12.dll", dir );
+                dxvk_beside |= file_exists( path );
+                snprintf( path, sizeof(path), "%s/d3d12core.dll", dir );
+                dxvk_beside |= file_exists( path );
+            }
+        }
+        dxvk_resolve_version( p->settings.dxvk_source, l->options->runtime_dir, p->machine,
+                              p->settings.dxvk_version, &dxvk );
+        vkd3d_resolve_version( l->options->runtime_dir, p->machine, p->settings.vkd3d_version, &vkd3d );
+        dxvk_ready = dxvk.installed &&
+                     (p->settings.d3d != LAUNCHER_D3D_DXVK_VKD3D ||
+                      launcher_dxvk_vkd3d_compatible( p->settings.dxvk_source, dxvk.version ));
+
+        count = 0;
+#define ADD_ROW(i, section, text, help_text) \
+        do { row = rows + count; memset( row, 0, sizeof(*row) ); ids[count++] = (i); \
+             row->group = (section); row->kind = UI_ROW_ACTION; \
+             snprintf( row->label, sizeof(row->label), "%s", (text) ); row->help = (help_text); } while (0)
+
+        ADD_ROW( ROW_START, SECTION_GENERAL, "Start", "Runs the game." );
+        {
+            int tone;
+
+            ADD_ROW( ROW_GAME_FIX, SECTION_GENERAL, "Game fix", fix_summary );
+            if (launcher_fixes_status( l->fixes, p->path, fix_summary, sizeof(fix_summary),
+                                       row->value, sizeof(row->value), &tone ))
+                row->value_tone = tone;
+            else count--;
+        }
+        ADD_ROW( ROW_FAVORITE, SECTION_GENERAL, "Favorite", "Keeps the game in the Favorites filter of the library." );
+        row->kind = UI_ROW_SWITCH;
+        row->on = p->favorite;
+        ADD_ROW( ROW_ARTWORK, SECTION_LIBRARY, "Download artwork", "Preview and choose this game's icon, cover and background from SteamGridDB." );
+        ADD_ROW( ROW_FORWARDER, SECTION_LIBRARY, "Create game forwarder", "A HOME Menu icon that launches this library game directly with its own settings." );
+        row->disabled = !p->added || !l->options->install_game_forwarder;
+        if (p->missing) ADD_ROW( ROW_LOCATE, SECTION_LIBRARY, "Locate executable", "Choose the game's executable at its new location." );
+        ADD_ROW( ROW_TITLE, SECTION_GENERAL, "Title",
+                 "The name shown in the library. Y goes back to the name in the program's own resources." );
+        row->kind = UI_ROW_VALUE;
+        snprintf( row->value, sizeof(row->value), "%s", p->title );
+        row->literal = 1;
+
+        ADD_ROW( ROW_ARGS, SECTION_GENERAL, "Arguments",
+                 "The command line after the program's name, kept beside it as NAME.args.txt. "
+                 "Leave it empty to remove them." );
+        line[0] = 0;
+        if (launcher_args_path( p->path, path, sizeof(path) )) read_line( path, line, sizeof(line) );
+        runtime_file( l, "args.txt", path, sizeof(path) );
+        if (line[0]) snprintf( row->value, sizeof(row->value), "%s", line );
+        else if (read_line( path, global_line, sizeof(global_line) ) && launcher_args_match( global_line, p->dos ))
+            snprintf( row->value, sizeof(row->value), "args.txt: %s", global_line );
+        else snprintf( row->value, sizeof(row->value), "None" );
+
+#ifdef WINE_NX_FEX
+        if (x86 || x64)
+        {
+            ADD_ROW( ROW_CPU, SECTION_EMULATION, "CPU translator", "Translator used to run this program." );
+            row->kind = UI_ROW_DROPDOWN;
+            row->choices = 2;
+            snprintf( row->value, sizeof(row->value), "%s", p->settings.fex ? "FEX" : "Box64" );
+        }
+#endif
+        ADD_ROW( ROW_FOUR_CORES, SECTION_EMULATION, "4-core support",
+                 l->options->four_cores_available
+                 ? "Moves graphics workers to core 3. Game threads stay on cores 0-2."
+                 : "Requires an updated Autorun forwarder. Reinstall it and restart Autorun." );
+        row->kind = UI_ROW_SWITCH;
+        row->disabled = !l->options->four_cores_available && !p->settings.four_cores;
+        row->on = p->settings.four_cores;
+        snprintf( row->value, sizeof(row->value), "%s", p->settings.four_cores ? "Enabled" : "Disabled" );
+
+        ADD_ROW( ROW_LAZY_FILE_VIEWS, SECTION_EMULATION, "Fast file loading",
+                 "Reads only the parts of the game's files it uses. Faster loading for games with large "
+                 "data files; turn it off if the game misbehaves." );
+        row->kind = UI_ROW_SWITCH;
+        row->on = p->settings.lazy_file_views;
+        snprintf( row->value, sizeof(row->value), "%s", p->settings.lazy_file_views ? "Enabled" : "Disabled" );
+
+        ADD_ROW( ROW_SYNC, SECTION_EMULATION, "Synchronization",
+                 "Horizon uses direct synchronization and targeted wakeups. Standard uses server requests." );
+        row->kind = UI_ROW_DROPDOWN;
+        row->choices = 2;
+        snprintf( row->value, sizeof(row->value), "%s", p->settings.fast_sync ? "Horizon" : "Standard" );
+
+        ADD_ROW( ROW_VERBOSE, SECTION_DIAGNOSTICS, "Verbose traces",
+                 "Writes Wine's traces to autorun_runtime.log, which slows the program down. "
+                 "Global follows the setting in Settings (X on the library)." );
+        row->adjustable = 1;
+        snprintf( row->value, sizeof(row->value), "%s",
+                  state_text( p->settings.verbose, l->options->verbose, "On", "Off", buffer, sizeof(buffer) ) );
+
+        ADD_ROW( ROW_PROFILE, SECTION_DIAGNOSTICS, "Profiler",
+                 "Samples where every thread spends its time and writes [PROF] lines to autorun_runtime.log." );
+        row->adjustable = 1;
+        snprintf( row->value, sizeof(row->value), "%s",
+                  state_text( p->settings.profile, l->options->profile, "On", "Off", buffer, sizeof(buffer) ) );
+
+        ADD_ROW( ROW_WINDOWS, SECTION_GRAPHICS, "Windows shown by",
+                 "The compositor draws every window through OpenGL. The framebuffer copies window pixels "
+                 "straight to the screen, for when the compositor misbehaves." );
+        row->adjustable = 1;
+        snprintf( row->value, sizeof(row->value), "%s",
+                  state_text( p->settings.framebuffer, l->options->framebuffer, "Framebuffer", "Compositor",
+                              buffer, sizeof(buffer) ) );
+
+        if (l->options->vulkan && (x86 || x64))
+        {
+            ADD_ROW( ROW_D3D9, SECTION_GRAPHICS, "Direct3D renderer",
+                      "Wine uses its built-in renderer. DXVK uses Vulkan for Direct3D 9/10/11; "
+                      "DXVK + VKD3D adds Direct3D 12. "
+                     "Graphics DLLs next to the game have priority." );
+            row->kind = UI_ROW_DROPDOWN;
+            row->choices = 3;
+            row->download = p->settings.d3d != LAUNCHER_D3D_WINE &&
+                            (!dxvk_ready || (p->settings.d3d == LAUNCHER_D3D_DXVK_VKD3D && !vkd3d.installed));
+            snprintf( row->value, sizeof(row->value), "%s%s%s",
+                      p->settings.d3d == LAUNCHER_D3D_WINE ? "Wine" :
+                      p->settings.d3d == LAUNCHER_D3D_DXVK ? "DXVK" : "DXVK + VKD3D",
+                      row->download ? " (download required)" : "",
+                      dxvk_beside ? " (app DLL first)" : "" );
+
+            if (p->settings.d3d == LAUNCHER_D3D_DXVK_VKD3D)
+            {
+                ADD_ROW( ROW_VKD3D_VERSION, SECTION_GRAPHICS, "VKD3D version",
+                         "Choose an official VKD3D GitHub release." );
+                row->kind = UI_ROW_DROPDOWN;
+                row->download = !vkd3d.installed;
+                snprintf( row->value, sizeof(row->value), "%s", vkd3d.version[0] ? vkd3d.version :
+                          vkd3d.installed ? "Bundled" : "Not installed" );
+            }
+
+            if (p->settings.d3d != LAUNCHER_D3D_WINE)
+            {
+                ADD_ROW( ROW_DXVK_VERSION, SECTION_GRAPHICS, "DXVK version",
+                         p->settings.d3d == LAUNCHER_D3D_DXVK_VKD3D ?
+                         "Choose an Official or GPLAsync release, version 2.1 or newer." :
+                         "Choose an Official, Sarek or GPLAsync release." );
+                row->kind = UI_ROW_DROPDOWN;
+                row->download = !dxvk_ready;
+                snprintf( row->value, sizeof(row->value), "%s %s",
+                          p->settings.dxvk_source == DXVK_SOURCE_SAREK ? "Sarek" :
+                          p->settings.dxvk_source == DXVK_SOURCE_GPLASYNC ? "GPLAsync" : "Official",
+                          !dxvk_ready ? "Not installed" : dxvk.version[0] ? dxvk.version : "Bundled" );
+                ADD_ROW( ROW_DXVK_HUD, SECTION_GRAPHICS, "DXVK HUD",
+                         "FPS shows only the frame rate. Compact shows the DirectX version, FPS and frame times. "
+                         "Full also shows the DXVK version, GPU, video memory and shader compiler activity. "
+                         "The DXVK HUD does not cover VKD3D's D3D12 rendering." );
+                row->kind = UI_ROW_DROPDOWN;
+                snprintf( row->value, sizeof(row->value), "%s", launcher_hud_labels[p->settings.dxvk_hud] );
+                row->choices = LAUNCHER_HUD_COUNT;
+
+                ADD_ROW( ROW_DXVK_OPTIONS, SECTION_GRAPHICS, "DXVK options",
+                         "Per-game performance, memory and compatibility options for the selected DXVK release. "
+                         "Default preserves DXVK's game profile. A local dxvk.conf takes priority." );
+                snprintf( row->value, sizeof(row->value), "Configure" );
+                row->disabled = !dxvk_ready;
+            }
+
+            ADD_ROW( ROW_FRAME_LIMIT, SECTION_GRAPHICS, "Frame rate limit",
+                     "Limits real game frames in Vulkan, DXVK and VKD3D. Off adds no cap. "
+                     "VSync and the game's own limit still apply." );
+            row->kind = UI_ROW_DROPDOWN;
+            snprintf( row->value, sizeof(row->value), "%s", launcher_frame_limit_labels[p->settings.frame_limit] );
+            row->choices = LAUNCHER_FRAME_LIMIT_COUNT;
+
+            ADD_ROW( ROW_VSYNC, SECTION_GRAPHICS, "VSync",
+                     "Synchronizes Vulkan, DXVK and VKD3D presentation to the display. LSFG-VK always uses synchronized presentation." );
+            row->kind = UI_ROW_SWITCH;
+            row->on = p->settings.vsync;
+            snprintf( row->value, sizeof(row->value), "%s", p->settings.vsync ? "Enabled" : "Disabled" );
+
+            ADD_ROW( ROW_UPSCALING, SECTION_GRAPHICS, "Upscaling",
+                     "How a Vulkan or DXVK game drawing fewer pixels than the screen is enlarged. FSR 1.0 is "
+                     "AMD's edge-aware upscaler with sharpening. Integer enlarges by whole steps with square "
+                     "pixels for pixel art, leaving wider black bars." );
+            row->kind = UI_ROW_DROPDOWN;
+            snprintf( row->value, sizeof(row->value), "%s", launcher_upscaling_labels[p->settings.upscaling] );
+            row->choices = LAUNCHER_UPSCALING_COUNT;
+
+            if (p->settings.upscaling == 1)
+            {
+                ADD_ROW( ROW_UPSCALING_SHARPNESS, SECTION_GRAPHICS, "FSR Sharpness",
+                         "How strongly FSR's second pass (RCAS) sharpens the enlarged picture. 0% leaves it "
+                         "as the first pass drew it." );
+                row->kind = UI_ROW_DROPDOWN;
+                snprintf( row->value, sizeof(row->value), "%s", launcher_sharpness_labels[p->settings.upscaling_sharpness] );
+                row->choices = LAUNCHER_SHARPNESS_COUNT;
+            }
+        }
+
+#ifdef WINE_NX_LSFG
+        runtime_file( l, "lsfg/Lossless.dll", path, sizeof(path) );
+        lsfg_installed = file_exists( path );
+        if (!lsfg_installed) p->settings.lsfg_enabled = 0;
+        ADD_ROW( ROW_LSFG, SECTION_FRAME_GENERATION, "LSFG-VK (2x)",
+                 "Generates one frame between each pair of game frames for Vulkan, DXVK and VKD3D only. "
+                 "Output follows the physical display resolution and uses synchronized presentation regardless of "
+                 "the VSync setting." );
+        row->kind = UI_ROW_SWITCH;
+        row->disabled = !lsfg_installed;
+        row->on = p->settings.lsfg_enabled;
+        snprintf( row->value, sizeof(row->value), "%s",
+                  !lsfg_installed ? "Unavailable" : p->settings.lsfg_enabled ? "Enabled" : "Disabled" );
+
+        ADD_ROW( ROW_LSFG_DLL, SECTION_FRAME_GENERATION, "Lossless.dll",
+                 "Copy Lossless.dll to sdmc:/switch/wine/lsfg/Lossless.dll." );
+        row->kind = UI_ROW_INFO;
+        row->disabled = 1;
+        if (lsfg_installed)
+        {
+            snprintf( row->value, sizeof(row->value), "Installed" );
+            row->value_tone = UI_VALUE_SUCCESS;
+        }
+        else
+        {
+            snprintf( row->value, sizeof(row->value), "Not found" );
+            row->value_tone = UI_VALUE_DANGER;
+        }
+
+        ADD_ROW( ROW_LSFG_PERFORMANCE, SECTION_FRAME_GENERATION, "Performance Mode",
+                 "Uses LSFG's performance path. Disable it for the quality path, which costs more GPU time." );
+        row->kind = UI_ROW_SWITCH;
+        row->on = p->settings.lsfg_performance;
+        snprintf( row->value, sizeof(row->value), "%s",
+                  p->settings.lsfg_performance ? "Enabled" : "Disabled" );
+
+        ADD_ROW( ROW_LSFG_FLOW, SECTION_FRAME_GENERATION, "Motion Resolution",
+                 "Resolution used to estimate motion. Lower values reduce GPU work and memory use; generated output "
+                 "still follows the physical display resolution." );
+        row->kind = UI_ROW_DROPDOWN;
+        snprintf( row->value, sizeof(row->value), "%s",
+                  launcher_lsfg_flow_labels[p->settings.lsfg_flow] );
+        row->choices = 3;
+#endif
+
+        {
+            launcher_input_rows( rows + count, l->options->runtime_dir, p->path, l->options->swkbd_auto );
+            for (i = 0; i < INPUT_ROW_COUNT; i++, count++)
+            {
+                ids[count] = ROW_INPUT + i;
+                rows[count].group = SECTION_CONTROLS;
+            }
+        }
+
+        if ((x86 || x64) && !p->settings.fex)
+        {
+            ADD_ROW( ROW_BOX64, SECTION_EMULATION, "Box64 options",
+                     "Per-game performance and compatibility flags for the Box64 translator." );
+            launcher_sibling_path( p->path, ".box64.txt", path, sizeof(path) );
+            box64_options_status( path, row->value, sizeof(row->value) );
+        }
+        else if ((x86 || x64) && p->settings.fex)
+        {
+            ADD_ROW( ROW_FEX, SECTION_EMULATION, "FEX options",
+                     "Per-game performance and compatibility flags for the FEX translator." );
+            if (launcher_program_settings_path( l->options->runtime_dir, p->path, path, sizeof(path) ))
+                fex_options_status( path, row->value, sizeof(row->value) );
+            else snprintf( row->value, sizeof(row->value), "Unavailable" );
+        }
+
+        if (in_library)
+        {
+            ADD_ROW( ROW_HIDE, SECTION_LIBRARY, "Hidden",
+                     "Hidden programs stay out of the library unless Settings shows them." );
+            row->kind = UI_ROW_SWITCH;
+            row->on = p->settings.hidden;
+        }
+        if (!in_library || p->added)
+        {
+            ADD_ROW( ROW_LIBRARY, SECTION_LIBRARY, in_library ? "Remove from the library" : "Add to the library",
+                     "The library finds programs within two folders of drive_c by itself; "
+                     "others found with the file browser can be added." );
+            row->destructive = in_library;
+        }
+#undef ADD_ROW
+
+        launcher_game_settings_load( game, l->options->runtime_dir, p->path, p->machine );
+        count += launcher_game_settings_rows( game, rows + count, ids + count, SECTION_GAME, PROGRAM_ROWS );
+        action = ui_settings_run( ui, &list, "Game Settings", p->title, sections,
+                                  sizeof(sections) / sizeof(sections[0]) - !game->profile, rows, count, 1, &section );
+        if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return 0;
+        /* The screen shows one section at a time, so the row it chose is the
+         * selection counted within that section. */
+        for (id = 0, i = 0; i < count; i++)
+            if (rows[i].group == section && id++ == list.selection) break;
+        id = i < count ? ids[i] : ids[0];
+        if (id >= ROW_INPUT && id <= ROW_INPUT_END)
+        {
+            launcher_input_edit( ui, &list, id - ROW_INPUT, action, l->options->runtime_dir,
+                                 p->path, p->title, l->options->swkbd_auto );
+            load_program_settings( l, p );
+            continue;
+        }
+        if (id >= PROGRAM_ROWS)
+        {
+            launcher_game_settings_action( game, l->options->runtime_dir, ui, &list, id - PROGRAM_ROWS, action );
+            continue;
+        }
+        switch (id)
+        {
+        case ROW_START:
+            if (p->missing)
+            {
+                ui_message( ui, "Game unavailable", "The executable could not be found. Remove this entry and add the game again at its new location." );
+                break;
+            }
+            return start_program( l, p, target, size );
+
+        case ROW_GAME_FIX:
+            if (action != UI_ACTION_CHOOSE) break;
+            if (launcher_fixes_forget( l->fixes, p->path ))
+                ui_toast( ui, "The fix is offered the next time the game starts", 2500 );
+            else ui_toast( ui, "Could not save the program's settings", 2500 );
+            load_program_settings( l, p );
+            break;
+
+        case ROW_FAVORITE:
+            if (action != UI_ACTION_CHOOSE) break;
+            p->favorite = !p->favorite;
+            if (!save_library( l )) p->favorite = !p->favorite;
+            else ui_toast( ui, p->favorite ? "Added to favorites" : "Removed from favorites", 1500 );
+            break;
+
+        case ROW_ARTWORK:
+            if (action == UI_ACTION_CHOOSE) download_artwork( l, p );
+            break;
+
+        case ROW_FORWARDER:
+            if (action == UI_ACTION_CHOOSE && p->added && save_library( l ))
+            {
+                char key[256] = "", previous[256];
+                struct launcher_forwarder_game game = { p->catalog_id, p->title, p->path, p->square_art };
+                launcher_kv_get( &l->look, "steamgriddb-key", key, sizeof(key) );
+                strcpy( previous, key );
+                launcher_forwarder_run( ui, l->options, &game, key, sizeof(key), pick_forwarder_icon, l );
+                if (strcmp( key, previous ))
+                {
+                    launcher_kv_set( &l->look, "steamgriddb-key", key );
+                    save_look( l );
+                }
+            }
+            break;
+
+        case ROW_LOCATE:
+            if (action == UI_ACTION_CHOOSE)
+            {
+                char selected[512];
+                struct program replacement;
+                int duplicate;
+                if (!file_browser_pick( l, selected, sizeof(selected) )) break;
+                duplicate = find_program( l, selected );
+                if (duplicate >= 0 && &l->programs[duplicate] != p)
+                {
+                    ui_message( ui, "Locate executable", "That executable already belongs to another library entry." );
+                    break;
+                }
+                if (!describe_program( l, &replacement, selected ))
+                {
+                    ui_message( ui, "Locate executable", "Autorun cannot run this executable." );
+                    break;
+                }
+                snprintf( p->path, sizeof(p->path), "%s", replacement.path );
+                snprintf( p->dos, sizeof(p->dos), "%s", replacement.dos );
+                snprintf( p->resource_title, sizeof(p->resource_title), "%s", replacement.resource_title );
+                p->machine = replacement.machine;
+                p->missing = 0;
+                load_program_settings( l, p );
+                save_library( l );
+                ui_toast( ui, "Executable location updated", 1800 );
+            }
+            break;
+
+        case ROW_TITLE:
+            if (action == UI_ACTION_RESET) p->settings.title[0] = 0;
+            else if (action == UI_ACTION_CHOOSE) edit_text( "Title", p->settings.title, sizeof(p->settings.title) );
+            else break;
+            save_program_settings( l, p );
+            save_library( l );
+            break;
+
+        case ROW_ARGS:
+            if (action != UI_ACTION_CHOOSE || !launcher_args_path( p->path, path, sizeof(path) )) break;
+            read_line( path, global_line, sizeof(global_line) );
+            if (!launcher_platform_prompt( "Arguments", global_line, line, sizeof(line) )) break;
+            if (line[0]) write_line( path, line );
+            else remove( path );
+            load_program_settings( l, p );
+            ui_toast( ui, line[0] ? "Arguments saved" : "Arguments removed", 1500 );
+            break;
+
+        case ROW_VERBOSE:
+        case ROW_PROFILE:
+        case ROW_WINDOWS:
+        {
+            int *state = id == ROW_VERBOSE ? &p->settings.verbose :
+                         id == ROW_PROFILE ? &p->settings.profile : &p->settings.framebuffer;
+
+            *state = action == UI_ACTION_RESET ? -1 : next_state( *state, action == UI_ACTION_LEFT ? -1 : 1 );
+            save_program_settings( l, p );
+            break;
+        }
+
+        case ROW_D3D9:
+        {
+            static const char *const names[] = { "Wine", "DXVK", "DXVK + VKD3D" };
+            struct launcher_settings previous = p->settings;
+            struct ui_row items[3] = {0};
+            int selected;
+
+            if (action == UI_ACTION_RESET) selected = LAUNCHER_D3D_DXVK;
+            else if (action == UI_ACTION_CHOOSE)
+            {
+                for (i = 0; i < 3; i++) snprintf( items[i].label, sizeof(items[i].label), "%s", names[i] );
+                selected = ui_settings_dropdown( ui, &list, items, 3, p->settings.d3d );
+                if (selected < 0) break;
+            }
+            else break;
+            p->settings.d3d = selected;
+            if (selected == LAUNCHER_D3D_DXVK_VKD3D &&
+                (p->settings.dxvk_source == DXVK_SOURCE_SAREK ||
+                 (p->settings.dxvk_version[0] &&
+                  !launcher_dxvk_vkd3d_compatible( p->settings.dxvk_source, p->settings.dxvk_version ))))
+            {
+                p->settings.dxvk_source = DXVK_SOURCE_OFFICIAL;
+                p->settings.dxvk_version[0] = 0;
+            }
+            if (selected != LAUNCHER_D3D_WINE && !prepare_program_graphics( l, p ))
+            {
+                p->settings = previous;
+                break;
+            }
+            save_program_settings( l, p );
+            break;
+        }
+
+#ifdef WINE_NX_FEX
+        case ROW_CPU:
+        {
+            struct ui_row items[2] = {0};
+            int selected;
+
+            if (action == UI_ACTION_RESET) selected = 1;
+            else if (action == UI_ACTION_CHOOSE)
+            {
+                snprintf( items[0].label, sizeof(items[0].label), "Box64" );
+                snprintf( items[1].label, sizeof(items[1].label), "FEX" );
+                selected = ui_settings_dropdown( ui, &list, items, 2, p->settings.fex );
+                if (selected < 0) break;
+            }
+            else break;
+            runtime_file( l, x64 ? "drive_c/windows/system32/libarm64ecfex.dll" :
+                                  "drive_c/windows/system32/libwow64fex.dll", path, sizeof(path) );
+            if (selected && !file_exists( path ))
+            {
+                ui_message( ui, "FEX", "Install the FEX runtime package first." );
+                break;
+            }
+            p->settings.fex = selected;
+            save_program_settings( l, p );
+            break;
+        }
+#endif
+        case ROW_FOUR_CORES:
+            if (action == UI_ACTION_RESET) p->settings.four_cores = 1;
+            else if (p->settings.four_cores) p->settings.four_cores = 0;
+            else if (l->options->four_cores_available) p->settings.four_cores = 1;
+            save_program_settings( l, p );
+            break;
+
+        case ROW_LAZY_FILE_VIEWS:
+            p->settings.lazy_file_views = action == UI_ACTION_RESET ? 0 : !p->settings.lazy_file_views;
+            save_program_settings( l, p );
+            break;
+
+        case ROW_SYNC:
+        {
+            struct ui_row items[2] = {0};
+            int selected;
+
+            if (action == UI_ACTION_RESET) p->settings.fast_sync = 0;
+            else if (action == UI_ACTION_CHOOSE)
+            {
+                snprintf( items[0].label, sizeof(items[0].label), "Standard" );
+                snprintf( items[1].label, sizeof(items[1].label), "Horizon" );
+                selected = ui_settings_dropdown( ui, &list, items, 2, p->settings.fast_sync );
+                if (selected < 0) break;
+                p->settings.fast_sync = selected;
+            }
+            else break;
+            save_program_settings( l, p );
+            break;
+        }
+
+        case ROW_VKD3D_VERSION:
+        case ROW_DXVK_VERSION:
+            if (action == UI_ACTION_RESET)
+            {
+                char *version = id == ROW_VKD3D_VERSION ? p->settings.vkd3d_version : p->settings.dxvk_version;
+                version[0] = 0;
+                if (id == ROW_DXVK_VERSION) p->settings.dxvk_source = DXVK_SOURCE_OFFICIAL;
+                save_program_settings( l, p );
+            }
+            else if (action == UI_ACTION_CHOOSE)
+            {
+                char *version = id == ROW_VKD3D_VERSION ? p->settings.vkd3d_version : p->settings.dxvk_version;
+                if (launcher_graphics_select( l->graphics, &list, p->machine, id == ROW_VKD3D_VERSION,
+                                              p->settings.d3d == LAUNCHER_D3D_DXVK_VKD3D,
+                                              &p->settings.dxvk_source, version ))
+                {
+                    save_program_settings( l, p );
+                }
+            }
+            break;
+
+        case ROW_DXVK_OPTIONS:
+            if (action != UI_ACTION_CHOOSE) break;
+            launcher_dxvk_options( ui, l->options->runtime_dir, p->path, p->title,
+                                   p->settings.dxvk_source, dxvk.version );
+            load_program_settings( l, p );
+            break;
+
+        case ROW_DXVK_HUD:
+        case ROW_FRAME_LIMIT:
+        {
+            int *value = id == ROW_DXVK_HUD ? &p->settings.dxvk_hud : &p->settings.frame_limit;
+            const char *const *labels = id == ROW_DXVK_HUD ? launcher_hud_labels : launcher_frame_limit_labels;
+            int choices = id == ROW_DXVK_HUD ? LAUNCHER_HUD_COUNT : LAUNCHER_FRAME_LIMIT_COUNT;
+            struct ui_row items[LAUNCHER_FRAME_LIMIT_COUNT] = {0};
+
+            if (action == UI_ACTION_RESET) *value = 0;
+            else if (action == UI_ACTION_CHOOSE)
+            {
+                for (i = 0; i < choices; i++)
+                    snprintf( items[i].label, sizeof(items[i].label), "%s", labels[i] );
+                int selected = ui_settings_dropdown( ui, &list, items, choices, *value );
+                if (selected < 0) break;
+                *value = selected;
+            }
+            else break;
+            save_program_settings( l, p );
+            break;
+        }
+
+        case ROW_VSYNC:
+        {
+            p->settings.vsync = action == UI_ACTION_RESET ? 1 : !p->settings.vsync;
+            save_program_settings( l, p );
+            break;
+        }
+
+        case ROW_UPSCALING:
+            if (action == UI_ACTION_RESET) p->settings.upscaling = 0;
+            else if (action == UI_ACTION_CHOOSE)
+            {
+                struct ui_row items[LAUNCHER_UPSCALING_COUNT] = {0};
+                int selected;
+
+                for (i = 0; i < LAUNCHER_UPSCALING_COUNT; i++)
+                    snprintf( items[i].label, sizeof(items[i].label), "%s", launcher_upscaling_labels[i] );
+                selected = ui_settings_dropdown( ui, &list, items, LAUNCHER_UPSCALING_COUNT, p->settings.upscaling );
+                if (selected < 0) break;
+                p->settings.upscaling = selected;
+            }
+            else break;
+            save_program_settings( l, p );
+            break;
+
+        case ROW_UPSCALING_SHARPNESS:
+            if (action == UI_ACTION_RESET) p->settings.upscaling_sharpness = 2;
+            else if (action == UI_ACTION_CHOOSE)
+            {
+                struct ui_row items[LAUNCHER_SHARPNESS_COUNT] = {0};
+                int selected;
+
+                for (i = 0; i < LAUNCHER_SHARPNESS_COUNT; i++)
+                    snprintf( items[i].label, sizeof(items[i].label), "%s", launcher_sharpness_labels[i] );
+                selected = ui_settings_dropdown( ui, &list, items, LAUNCHER_SHARPNESS_COUNT, p->settings.upscaling_sharpness );
+                if (selected < 0) break;
+                p->settings.upscaling_sharpness = selected;
+            }
+            else break;
+            save_program_settings( l, p );
+            break;
+
+#ifdef WINE_NX_LSFG
+        case ROW_LSFG:
+        case ROW_LSFG_PERFORMANCE:
+        {
+            int *value = id == ROW_LSFG ? &p->settings.lsfg_enabled : &p->settings.lsfg_performance;
+
+            *value = action == UI_ACTION_RESET ? id == ROW_LSFG_PERFORMANCE : !*value;
+            save_program_settings( l, p );
+            break;
+        }
+
+        case ROW_LSFG_FLOW:
+            if (action == UI_ACTION_RESET) p->settings.lsfg_flow = 1;
+            else if (action == UI_ACTION_CHOOSE)
+            {
+                struct ui_row items[3] = {0};
+                int selected;
+
+                for (i = 0; i < 3; i++)
+                    snprintf( items[i].label, sizeof(items[i].label), "%s", launcher_lsfg_flow_labels[i] );
+                selected = ui_settings_dropdown( ui, &list, items, 3, p->settings.lsfg_flow );
+                if (selected < 0) break;
+                p->settings.lsfg_flow = selected;
+            }
+            else break;
+            save_program_settings( l, p );
+            break;
+#endif
+
+        case ROW_BOX64:
+            if (action != UI_ACTION_CHOOSE) break;
+            box64_options_menu( l, p );
+            break;
+
+        case ROW_FEX:
+            if (action != UI_ACTION_CHOOSE) break;
+            fex_options_menu( l, p );
+            break;
+
+        case ROW_HIDE:
+            if (action == UI_ACTION_RESET) p->settings.hidden = 0;
+            else if (action == UI_ACTION_CHOOSE) p->settings.hidden = !p->settings.hidden;
+            else break;
+            save_program_settings( l, p );
+            ui_toast( ui, p->settings.hidden ? "Hidden from the library" : "Shown in the library", 1500 );
+            break;
+
+        case ROW_LIBRARY:
+            if (action != UI_ACTION_CHOOSE) break;
+            if (in_library)
+            {
+                int index = find_program( l, p->path );
+
+                l->programs[index].removed = 1;
+                if (!save_library( l ))
+                {
+                    l->programs[index].removed = 0;
+                    break;
+                }
+                ui_toast( ui, "Removed from the library", 1500 );
+                /* p may be the removed entry itself; the menu goes on with a copy. */
+                copy = *p;
+                copy.icon = NULL;
+                copy.added = 0;
+                p = &copy;
+            }
+            else
+            {
+                int index = add_program( l, p->path, 1 );
+
+                if (index < 0) break;
+                save_library( l );
+                p = &l->programs[index];
+                apply_new_game_renderer( l, p );
+                ui_toast( ui, launcher_fixes_pending( l->fixes, p->path ) ?
+                          "Added. This game has a fix, offered when it starts" : "Added to the library", 2500 );
+            }
+            break;
+        }
+    }
+}
+
+static int program_menu( struct launcher *l, struct program *p, char *target, size_t size )
+{
+    struct launcher_game_settings game = {0};
+    int result = program_menu_run( l, p, target, size, &game );
+    game_settings_close( game.settings );
+    return result;
+}
+
+/***********************************************************************
+ * Settings
+ */
+
+enum settings_row
+{
+    SET_HIDDEN, SET_HIDE_MISSING, SET_DXVK_ON_ADD, SET_VERBOSE, SET_PROFILE, SET_WINDOWS,
+    SET_INPUT, SET_INPUT_END = SET_INPUT + INPUT_ROW_COUNT - 1, SET_STEAMGRIDDB, SET_DOWNLOAD_COVERS,
+    SET_DLLS, SET_UPDATE, SET_SETUP, SET_REOPEN, SET_MAKE_MAIN,
+#ifdef WINE_NX_SWAP_POC
+    SET_SWAP_SIZE,
+#endif
+    SET_CREDITS, SET_LANGUAGE, SET_DIAGNOSTICS, SET_FTP, SETTINGS_ROWS
+};
+
+static void save_look( struct launcher *l )
+{
+    char path[512];
+
+    launcher_kv_set( &l->look, "theme", NULL );
+    /* What the library shows is worked out from the screen now, and the
+     * animations are simply on, so none of these are kept. */
+    launcher_kv_set( &l->look, "animations", NULL );
+    launcher_kv_set( &l->look, "columns", NULL );
+    launcher_kv_set( &l->look, "rows", NULL );
+    launcher_kv_set( &l->look, "show-hidden", l->show_hidden ? "1" : "0" );
+    launcher_kv_set( &l->look, "hide-missing", l->hide_missing ? "1" : NULL );
+    launcher_kv_set( &l->look, "language", launcher_language_code() );
+#ifdef WINE_NX_SWAP_POC
+    launcher_kv_set( &l->look, "swap-poc-mb", NULL );
+    launcher_kv_set( &l->look, "swap-in-game", NULL );
+#endif
+    launcher_kv_set( &l->look, "browse", l->browse_dir );
+    runtime_file( l, "launcher.txt", path, sizeof(path) );
+    launcher_kv_save( &l->look, path );
+}
+
+static const struct { const char *name, *by; } credits[] =
+{
+    { "RUNTIME & TRANSLATION", NULL },
+    { "Wine", "WineHQ  /  LGPL-2.1+" },
+    { "Box64", "ptitSeb  /  MIT" },
+    { "FEX", "Ryan Houdek (Sonicadvance1) and contributors  /  MIT" },
+    { "GRAPHICS", NULL },
+    { "DXVK", "Philip Rebohle and contributors  /  zlib" },
+    { "VKD3D-Proton", "Hans-Kristian Arntzen, Philip Rebohle and contributors  /  LGPL-2.1" },
+    { "Mesa", "Mesa3D  /  MIT" },
+    { "mesa-switch", "danfromtico, NaGaa95 and contributors" },
+    { "Switch Mesa & libdrm_nouveau", "fincs, Subv, Jules Blok  /  MIT" },
+    { "LSFG-VK", "Pancake (PancakeTAS) and contributors  /  GPL-3.0+" },
+    { "PLATFORM", NULL },
+    { "libnx", "switchbrew  /  ISC" },
+    { "devkitPro", "devkitA64 and portlibs" },
+    { "Atmosphere", "Atmosphere-NX  /  Horizon platform reference" },
+    { "INTERFACE & LIBRARIES", NULL },
+    { "ftpsrv", "TotalJustice  /  MIT" },
+    { "Joy-Con illustration", "0 Noctis 0  /  CC BY-SA 4.0" },
+    { "Controller button icons", "Zacksly  /  CC BY 3.0" },
+    { "SDL2 & SDL2_ttf", "Sam Lantinga and contributors  /  zlib" },
+    { "FreeType", "FreeType Project  /  FTL" },
+    { "HarfBuzz", "HarfBuzz authors  /  MIT" },
+    { "libpng, zlib & bzip2", "libpng, zlib and BSD licenses" },
+    { "TOOLS", NULL },
+    { "llvm-mingw", "Martin Storsjo  /  Apache-2.0" },
+    { "7-Zip", "Igor Pavlov  /  LGPL-2.1" },
+    { "sphaira", "ITotalJustice, NaGaa95  /  Home menu forwarders" },
+    { "REFERENCES & INSPIRATION", NULL },
+    { "dolphin-nx", "NaGaa95" },
+    { "tico-dolphin", "ticohq" },
+    { "WineBox64 NX", "Ibnuard" },
+};
+#define CREDIT_COUNT (sizeof(credits) / sizeof(credits[0]))
+
+static void credits_screen( struct launcher *l )
+{
+    struct ui *ui = &l->ui;
+    struct ui_input input;
+    const SDL_Color background = { 5, 8, 10, 255 }, accent = { 151, 200, 181, 255 };
+    const int logo_width = 320, title_gap = 256, entry_height = 92, section_height = 132;
+    int logo_height = 0, width, height, y, end_y = ui->height / 2 - 50 + title_gap;
+    int old_hide_overlays = ui->hide_overlays, done = 0, manual = 0;
+    Uint32 previous = SDL_GetTicks(), finished = 0;
+    float scroll = 0, distance;
+    size_t i;
+
+    if (l->logo && !SDL_QueryTexture( l->logo, NULL, NULL, &width, &height ) && width > 0)
+        logo_height = height * logo_width / width;
+    for (i = 0; i < CREDIT_COUNT; i++)
+        end_y += credits[i].by ? entry_height : section_height;
+    end_y += ui->height / 2;
+    distance = end_y - (ui->height - logo_height - 100) / 2;
+    ui->hide_overlays = 1;
+    ui->footer_count = 0;
+    ui_start_screen( ui );
+    while (!done && ui_begin_frame( ui ))
+    {
+        Uint32 now = SDL_GetTicks();
+        float elapsed = now - previous, speed = 0;
+        previous = now;
+        if (elapsed > 50) elapsed = 50;
+
+        while (ui_poll( ui, &input ))
+        {
+            if (input.button == UI_B || input.button == UI_PLUS || input.touch == UI_TOUCH_TAP ||
+                (scroll >= distance && input.button == UI_A)) done = 1;
+            if ((input.button == UI_UP || input.button == UI_DOWN) && abs(ui->axes[SDL_CONTROLLER_AXIS_LEFTY]) < 6000)
+            {
+                manual = 1;
+                scroll += input.button == UI_UP ? -72 : 72;
+            }
+            if (input.touch == UI_TOUCH_SCROLL_UP || input.touch == UI_TOUCH_SCROLL_DOWN)
+            {
+                manual = 1;
+                scroll += (input.touch == UI_TOUCH_SCROLL_UP ? 1 : -1) * input.steps * 36;
+            }
+        }
+        for (i = 0; i < 4; i++) if (abs(ui->axes[i]) > 6000) manual = 1;
+        if (done || !ui->running) break;
+        if (!manual) speed = 0.08184f;
+        else if (abs(ui->axes[SDL_CONTROLLER_AXIS_LEFTY]) > 6000)
+        {
+            int axis = ui->axes[SDL_CONTROLLER_AXIS_LEFTY];
+            speed = (axis > 0 ? 1 : -1) * 0.65f * (abs(axis) - 6000) / (32768 - 6000);
+        }
+        scroll = fmaxf(0, fminf(distance, scroll + speed * elapsed));
+        if (manual) finished = 0;
+        else if (scroll >= distance)
+        {
+            scroll = distance;
+            if (!finished) finished = now;
+            if (now - finished >= 5000) break;
+        }
+        ui_fill( ui, 0, 0, ui->width, ui->height, background );
+        y = ui->height / 2 - 50 - (int)scroll;
+        if (y > -100)
+        {
+            ui_text_centered( ui, ui->large, ui->width / 2, y, "Autorun", ui->value );
+            ui_text_centered( ui, ui->normal, ui->width / 2, y + 52, "People and projects behind the port", ui->dim );
+        }
+        y += title_gap;
+        for (i = 0; i < CREDIT_COUNT; i++)
+        {
+            int section = !credits[i].by;
+            int block_height = section ? section_height : entry_height;
+
+            if (y + block_height > 0 && y < ui->height)
+            {
+                if (section)
+                {
+                    ui_fill( ui, ui->width / 2 - 24, y + 32, 48, 2, accent );
+                    ui_text_centered( ui, ui->small, ui->width / 2, y + 56, credits[i].name, accent );
+                }
+                else
+                {
+                    ui_text_centered( ui, ui->normal, ui->width / 2, y, credits[i].name, ui->value );
+                    ui_text_centered( ui, ui->small, ui->width / 2, y + 36, credits[i].by, ui->dim );
+                }
+            }
+            y += block_height;
+        }
+        y = end_y - (int)scroll;
+        if (y < ui->height)
+        {
+            if (logo_height)
+            {
+                SDL_Rect rect = { (ui->width - logo_width) / 2, y, logo_width, logo_height };
+
+                SDL_SetTextureColorMod( l->logo, 255, 255, 255 );
+                SDL_SetTextureAlphaMod( l->logo, 255 );
+                SDL_RenderCopy( ui->renderer, l->logo, NULL, &rect );
+            }
+            ui_text_centered( ui, ui->large, ui->width / 2, y + logo_height + 16, "Autorun", ui->value );
+            ui_text_centered( ui, ui->normal, ui->width / 2, y + logo_height + 64, "ticoverse.com", accent );
+        }
+        ui_gradient( ui, 0, 0, ui->width, 80, background, (SDL_Color){ 5, 8, 10, 0 }, 0 );
+        ui_gradient( ui, 0, ui->height - 80, ui->width, 80, (SDL_Color){ 5, 8, 10, 0 }, background, 0 );
+        ui_fade( ui );
+        if (finished && now - finished > 4600)
+            ui_fill( ui, 0, 0, ui->width, ui->height, (SDL_Color){ 5, 8, 10, (now - finished - 4600) * 255 / 400 } );
+        ui->scrolling_text = !manual || speed != 0;
+        ui_present( ui );
+        ui_wait( ui );
+    }
+    if (done) ui_sound( ui, LAUNCHER_SOUND_BACK );
+    ui->hide_overlays = old_hide_overlays;
+    ui_start_screen( ui );
+}
+
+static void reload_after_ftp( struct launcher *l )
+{
+    char path[512], language[16] = "ru";
+
+    stop_icons( l );
+    l->stop = 0;
+    l->program_count = 0;
+    l->backdrop = l->backdrop_previous = -1;
+    runtime_file( l, "launcher.txt", path, sizeof(path) );
+    if (launcher_kv_load( &l->look, path ))
+    {
+        l->show_hidden = launcher_kv_get_int( &l->look, "show-hidden", 0 ) == 1;
+        l->hide_missing = launcher_kv_get_int( &l->look, "hide-missing", 0 ) == 1;
+        launcher_kv_get( &l->look, "browse", l->browse_dir, sizeof(l->browse_dir) );
+        launcher_kv_get( &l->look, "language", language, sizeof(language) );
+        launcher_set_language( language );
+    }
+    load_library( l );
+    rebuild_visible( l, -1 );
+    rebuild_history( l, -1 );
+    start_icons( l );
+}
+
+/* The sections of Settings, in the order they stand in the list. */
+enum settings_section { SET_SECTION_LIBRARY, SET_SECTION_DEFAULTS, SET_SECTION_CONTROLS, SET_SECTION_ARTWORK, SET_SECTION_SYSTEM };
+
+static void settings_menu( struct launcher *l )
+{
+    static const char *const sections[] = { "Library", "Game defaults", "Controls", "Artwork", "System" };
+    static const char *on_off[2] = { "Off", "On" };
+    static int section;
+    struct ui_row rows[SETTINGS_ROWS];
+    struct ui_list list = {0};
+    struct ui *ui = &l->ui;
+    char path[512];
+
+    for (;;)
+    {
+        enum ui_action action;
+        int i;
+        static const unsigned char row_section[SETTINGS_ROWS] =
+        {
+            [SET_HIDDEN] = SET_SECTION_LIBRARY,
+            [SET_HIDE_MISSING] = SET_SECTION_LIBRARY,
+            [SET_DXVK_ON_ADD] = SET_SECTION_LIBRARY,
+            [SET_VERBOSE] = SET_SECTION_DEFAULTS, [SET_PROFILE] = SET_SECTION_DEFAULTS,
+            [SET_WINDOWS] = SET_SECTION_DEFAULTS,
+            [SET_STEAMGRIDDB] = SET_SECTION_ARTWORK,
+            [SET_DOWNLOAD_COVERS] = SET_SECTION_ARTWORK,
+            [SET_REOPEN] = SET_SECTION_SYSTEM,
+            [SET_DLLS] = SET_SECTION_SYSTEM,
+            [SET_UPDATE] = SET_SECTION_SYSTEM,
+            [SET_SETUP] = SET_SECTION_SYSTEM,
+            [SET_MAKE_MAIN] = SET_SECTION_SYSTEM,
+#ifdef WINE_NX_SWAP_POC
+            [SET_SWAP_SIZE] = SET_SECTION_SYSTEM,
+#endif
+            [SET_CREDITS] = SET_SECTION_SYSTEM,
+            [SET_LANGUAGE] = SET_SECTION_SYSTEM,
+            [SET_DIAGNOSTICS] = SET_SECTION_SYSTEM,
+            [SET_FTP] = SET_SECTION_SYSTEM,
+        };
+
+        memset( rows, 0, sizeof(rows) );
+        for (i = 0; i < SETTINGS_ROWS; i++)
+        {
+            rows[i].adjustable = 1;
+            rows[i].kind = UI_ROW_VALUE;
+            rows[i].group = row_section[i];
+        }
+        snprintf( rows[SET_HIDDEN].label, sizeof(rows[0].label), "Show hidden programs" );
+        snprintf( rows[SET_HIDDEN].value, sizeof(rows[0].value), "%s", on_off[l->show_hidden] );
+        rows[SET_HIDDEN].help = "Programs hidden from a game's own settings are listed again.";
+        rows[SET_HIDDEN].kind = UI_ROW_SWITCH;
+        rows[SET_HIDDEN].on = l->show_hidden;
+        snprintf( rows[SET_HIDE_MISSING].label, sizeof(rows[0].label), "Hide missing programs" );
+        snprintf( rows[SET_HIDE_MISSING].value, sizeof(rows[0].value), "%s", on_off[l->hide_missing] );
+        rows[SET_HIDE_MISSING].help = "Hide unavailable games. USB games return when the drive reconnects.";
+        rows[SET_HIDE_MISSING].kind = UI_ROW_SWITCH;
+        rows[SET_HIDE_MISSING].on = l->hide_missing;
+        snprintf( rows[SET_DXVK_ON_ADD].label, sizeof(rows[0].label), "Give a new game DXVK" );
+        snprintf( rows[SET_DXVK_ON_ADD].value, sizeof(rows[0].value), "%s", on_off[!!l->options->dxvk_on_add] );
+        rows[SET_DXVK_ON_ADD].kind = UI_ROW_SWITCH;
+        rows[SET_DXVK_ON_ADD].on = !!l->options->dxvk_on_add;
+        rows[SET_DXVK_ON_ADD].help = "New games use DXVK. When off, newly added games use Wine.";
+        snprintf( rows[SET_VERBOSE].label, sizeof(rows[0].label), "Verbose traces" );
+        snprintf( rows[SET_VERBOSE].value, sizeof(rows[0].value), "%s", on_off[!!l->options->verbose] );
+        rows[SET_VERBOSE].kind = UI_ROW_SWITCH;
+        rows[SET_VERBOSE].on = !!l->options->verbose;
+        rows[SET_VERBOSE].help = "Wine's traces go to autorun_runtime.log for every program without its own setting.";
+        snprintf( rows[SET_PROFILE].label, sizeof(rows[0].label), "Profiler" );
+        snprintf( rows[SET_PROFILE].value, sizeof(rows[0].value), "%s", on_off[!!l->options->profile] );
+        rows[SET_PROFILE].kind = UI_ROW_SWITCH;
+        rows[SET_PROFILE].on = !!l->options->profile;
+        rows[SET_PROFILE].help = "[PROF] lines with where each thread spends its time.";
+        snprintf( rows[SET_WINDOWS].label, sizeof(rows[0].label), "Windows shown by" );
+        snprintf( rows[SET_WINDOWS].value, sizeof(rows[0].value), "%s",
+                  l->options->framebuffer ? "Framebuffer" : "Compositor" );
+        rows[SET_WINDOWS].help = "The framebuffer copies window pixels straight to the screen, "
+                                 "for when the OpenGL compositor misbehaves.";
+        launcher_input_rows( rows + SET_INPUT, l->options->runtime_dir, NULL, l->options->swkbd_auto );
+        for (i = SET_INPUT; i <= SET_INPUT_END; i++) rows[i].group = SET_SECTION_CONTROLS;
+
+        snprintf( rows[SET_STEAMGRIDDB].label, sizeof(rows[0].label), "SteamGridDB API key" );
+        snprintf( rows[SET_STEAMGRIDDB].value, sizeof(rows[0].value), "%s",
+                  launcher_kv_get( &l->look, "steamgriddb-key", path, sizeof(path) ) && path[0] ? "Configured" : "Not set" );
+        rows[SET_STEAMGRIDDB].help = "Used to download icons, covers and backgrounds from SteamGridDB.";
+        rows[SET_STEAMGRIDDB].adjustable = 0;
+        snprintf( rows[SET_DOWNLOAD_COVERS].label, sizeof(rows[0].label), "Download all covers" );
+        rows[SET_DOWNLOAD_COVERS].help = "Fill missing icons, covers and backgrounds. Existing artwork is kept.";
+        rows[SET_DOWNLOAD_COVERS].kind = UI_ROW_ACTION;
+        rows[SET_DOWNLOAD_COVERS].adjustable = 0;
+        {
+            int tone;
+
+            snprintf( rows[SET_DLLS].label, sizeof(rows[0].label), "Windows DLLs" );
+            snprintf( rows[SET_DLLS].value, sizeof(rows[0].value), "%s",
+                      launcher_dlls_status( l->dlls, path, sizeof(path), &tone ) );
+            rows[SET_DLLS].value_tone = tone;
+            rows[SET_DLLS].kind = UI_ROW_ACTION;
+            rows[SET_DLLS].adjustable = 0;
+            rows[SET_DLLS].disabled = !l->dlls;
+            rows[SET_DLLS].help = "The Windows files games run on, from Autorun's DLL repository: download, "
+                                  "update and verify them.";
+        }
+        snprintf( rows[SET_UPDATE].label, sizeof(rows[0].label), "Check for update" );
+        rows[SET_UPDATE].kind = UI_ROW_ACTION;
+        rows[SET_UPDATE].adjustable = 0;
+        rows[SET_UPDATE].disabled = !l->update;
+        rows[SET_UPDATE].help = "Official Autorun releases, changelog and installation. Games and settings are preserved.";
+        snprintf( rows[SET_SETUP].label, sizeof(rows[0].label), "Quick setup" );
+        rows[SET_SETUP].kind = UI_ROW_ACTION;
+        rows[SET_SETUP].adjustable = 0;
+        rows[SET_SETUP].help = "Install the Autorun forwarder or update its patched Hekate boot entry.";
+        snprintf( rows[SET_REOPEN].label, sizeof(rows[0].label), "Return here when a program ends" );
+        snprintf( rows[SET_REOPEN].value, sizeof(rows[0].value), "%s", on_off[!!l->options->reopen_launcher] );
+        rows[SET_REOPEN].kind = UI_ROW_SWITCH;
+        rows[SET_REOPEN].on = !!l->options->reopen_launcher;
+        rows[SET_REOPEN].help = "Autorun starts itself again instead of closing to the HOME menu. "
+                                "A forwarder made by sphaira cannot do it and stops the console.";
+        snprintf( rows[SET_MAKE_MAIN].label, sizeof(rows[0].label), "Make an Autorun forwarder" );
+        snprintf( rows[SET_MAKE_MAIN].value, sizeof(rows[0].value), "%s",
+                  l->options->install_forwarder ? "Autorun" : "Unavailable" );
+        rows[SET_MAKE_MAIN].help = "Installs the 39-bit Autorun forwarder. Fixed-address Win32 games also "
+                                   "require the Atmosphere low-address patch. Use emuMMC only.";
+        rows[SET_MAKE_MAIN].adjustable = 0;
+        rows[SET_MAKE_MAIN].disabled = !l->options->install_forwarder;
+#ifdef WINE_NX_SWAP_POC
+        {
+            int size = launcher_kv_get_int( &l->look, "swap-mb", 0 );
+            snprintf( rows[SET_SWAP_SIZE].label, sizeof(rows[0].label), "SD swap" );
+            if (size) snprintf( rows[SET_SWAP_SIZE].value, sizeof(rows[0].value), "%d MiB", size );
+            else snprintf( rows[SET_SWAP_SIZE].value, sizeof(rows[0].value), "Off" );
+            rows[SET_SWAP_SIZE].kind = UI_ROW_DROPDOWN;
+            rows[SET_SWAP_SIZE].adjustable = 0;
+            rows[SET_SWAP_SIZE].disabled = l->options->address_space_bits != 39 && !size;
+            rows[SET_SWAP_SIZE].help = "Offload private game memory when RAM is low. May cause pauses; "
+                                       "GPU and shared memory stay in RAM. Off removes the swap files.";
+        }
+#endif
+        snprintf( rows[SET_CREDITS].label, sizeof(rows[0].label), "Credits" );
+        rows[SET_CREDITS].kind = UI_ROW_ACTION;
+        rows[SET_CREDITS].help = "People and projects behind Autorun.";
+        rows[SET_CREDITS].adjustable = 0;
+
+        snprintf( rows[SET_LANGUAGE].label, sizeof(rows[0].label), "Language" );
+        snprintf( rows[SET_LANGUAGE].value, sizeof(rows[0].value), "%s",
+                  !strcmp( launcher_language_code(), "ru" ) ? "Русский" : "English" );
+        rows[SET_LANGUAGE].help = "Language changes immediately and is saved for the next launch.";
+        snprintf( rows[SET_DIAGNOSTICS].label, sizeof(rows[0].label), "Diagnostics" );
+        rows[SET_DIAGNOSTICS].kind = UI_ROW_ACTION;
+        rows[SET_DIAGNOSTICS].adjustable = 0;
+        rows[SET_DIAGNOSTICS].help = "Create a ZIP with logs and diagnostic settings. No game files, saves or raw settings are included.";
+        snprintf( rows[SET_FTP].label, sizeof(rows[0].label), "FTP server" );
+        rows[SET_FTP].kind = UI_ROW_ACTION;
+        rows[SET_FTP].adjustable = 0;
+        rows[SET_FTP].help = "Upload games and settings, or download logs. The server is limited to switch/wine.";
+
+        action = ui_settings_run( ui, &list, "Settings", NULL, sections,
+                                  sizeof(sections) / sizeof(sections[0]), rows, SETTINGS_ROWS, 0, &section );
+        if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return;
+        /* One section is shown at a time, so what it chose is counted within
+         * that section: find the row it stands for. */
+        {
+            int shown = 0;
+
+            for (i = 0; i < SETTINGS_ROWS; i++)
+                if (rows[i].group == section && shown++ == list.selection) break;
+            if (i >= SETTINGS_ROWS) continue;
+        }
+        if (i >= SET_INPUT && i <= SET_INPUT_END)
+        {
+            launcher_input_edit( ui, &list, i - SET_INPUT, action, l->options->runtime_dir,
+                                 NULL, "All games", l->options->swkbd_auto );
+            continue;
+        }
+        switch (i)
+        {
+        case SET_HIDDEN: l->show_hidden = !l->show_hidden; break;
+        case SET_LANGUAGE:
+            launcher_set_language( !strcmp( launcher_language_code(), "ru" ) ? "en" : "ru" );
+            ui_start_screen( ui );
+            break;
+        case SET_DIAGNOSTICS:
+            if (action == UI_ACTION_CHOOSE)
+            {
+                save_look( l );
+                if (diagnostics_screen( ui, l->options )) reload_after_ftp( l );
+            }
+            ui_start_screen( ui );
+            break;
+        case SET_FTP:
+            if (action == UI_ACTION_CHOOSE)
+            {
+                save_look( l );
+                if (ftp_server_screen( ui, l->options )) reload_after_ftp( l );
+            }
+            ui_start_screen( ui );
+            break;
+        case SET_HIDE_MISSING: l->hide_missing = !l->hide_missing; break;
+        /* The runtime keeps these: it owns the settings file and writes every
+         * one of them at once when the launcher closes. */
+        case SET_VERBOSE: l->options->verbose = !l->options->verbose; break;
+        case SET_PROFILE: l->options->profile = !l->options->profile; break;
+        case SET_WINDOWS: l->options->framebuffer = !l->options->framebuffer; break;
+        case SET_DXVK_ON_ADD: l->options->dxvk_on_add = !l->options->dxvk_on_add; break;
+        case SET_REOPEN: l->options->reopen_launcher = !l->options->reopen_launcher; break;
+        case SET_DLLS:
+            if (action == UI_ACTION_CHOOSE) launcher_dlls_open( l->dlls );
+            ui_start_screen( ui );
+            break;
+        case SET_UPDATE:
+            if (action == UI_ACTION_CHOOSE) launcher_update_open( l->update );
+            ui_start_screen( ui );
+            break;
+        case SET_SETUP:
+            if (action == UI_ACTION_CHOOSE) quick_setup( l );
+            break;
+        case SET_STEAMGRIDDB:
+        {
+            char key[512] = "";
+            launcher_kv_get( &l->look, "steamgriddb-key", key, sizeof(key) );
+            if (action == UI_ACTION_CHOOSE && launcher_platform_prompt( "SteamGridDB API key (blank removes)", key, key, sizeof(key) ))
+                launcher_kv_set( &l->look, "steamgriddb-key", key[0] ? key : NULL );
+            break;
+        }
+        case SET_DOWNLOAD_COVERS:
+            if (action == UI_ACTION_CHOOSE) download_all_covers( l );
+            ui_start_screen( ui );
+            break;
+        case SET_MAKE_MAIN:
+            if (action == UI_ACTION_CHOOSE) make_forwarder( l );
+            break;
+
+#ifdef WINE_NX_SWAP_POC
+        case SET_SWAP_SIZE:
+        {
+            static const int sizes[] = { 0, 1024, 2048 };
+            struct ui_row items[3] = {0};
+            int j, selected = 0, size = launcher_kv_get_int( &l->look, "swap-mb", 0 );
+            if (action != UI_ACTION_CHOOSE && action != UI_ACTION_RESET) break;
+            snprintf( items[0].label, sizeof(items[0].label), "Off" );
+            for (j = 1; j < 3; j++)
+            {
+                snprintf( items[j].label, sizeof(items[j].label), "%d MiB", sizes[j] );
+                if (sizes[j] == size) selected = j;
+            }
+            selected = action == UI_ACTION_RESET ? 0 : ui_settings_dropdown( ui, &list, items, 3, selected );
+            if (selected >= 0)
+            {
+                char value[16];
+                if (!selected)
+                {
+                    runtime_file( l, "swap-poc", path, sizeof(path) );
+                    if (swap_store_remove( path )) ui_message( ui, "SD swap", strerror(errno) );
+                    else
+                    {
+                        launcher_kv_set( &l->look, "swap-mb", NULL );
+                        ui_toast( ui, "SD swap disabled", 1800 );
+                    }
+                }
+                else if (l->options->address_space_bits == 39)
+                {
+                    runtime_file( l, "swap-poc", path, sizeof(path) );
+                    if (launcher_swap_prepare( ui, path, sizes[selected] ))
+                    {
+                        snprintf( value, sizeof(value), "%d", sizes[selected] );
+                        launcher_kv_set( &l->look, "swap-mb", value );
+                        ui_toast( ui, "SD swap enabled", 1800 );
+                    }
+                }
+            }
+            break;
+        }
+#endif
+
+        case SET_CREDITS:
+            credits_screen( l );
+            ui_start_screen( ui );
+            continue;
+        }
+        save_look( l );
+    }
+}
+
+static void library_menu( struct launcher *l )
+{
+    struct ui_row rows[4];
+    struct ui_list list = {0};
+    static const char *sort_names[] = { "Title", "Recently added", "Recently launched" };
+
+    for (;;)
+    {
+        enum ui_action action;
+        memset( rows, 0, sizeof(rows) );
+        snprintf( rows[0].label, sizeof(rows[0].label), "Search" );
+        snprintf( rows[0].value, sizeof(rows[0].value), "%s", l->search[0] ? l->search : "All titles" );
+        snprintf( rows[1].label, sizeof(rows[1].label), "Favorites only" );
+        snprintf( rows[1].value, sizeof(rows[1].value), "%s", l->favorites_only ? "On" : "Off" );
+        rows[1].adjustable = 1;
+        snprintf( rows[2].label, sizeof(rows[2].label), "Sort by" );
+        snprintf( rows[2].value, sizeof(rows[2].value), "%s", sort_names[l->sort_order] );
+        rows[2].adjustable = 1;
+        snprintf( rows[3].label, sizeof(rows[3].label), "Launcher settings" );
+
+        action = ui_list_run( &l->ui, &list, "Library", "Filter and sort", rows, 4, 1 );
+        if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return;
+        switch (list.selection)
+        {
+        case 0:
+            if (action == UI_ACTION_RESET) l->search[0] = 0;
+            else if (action == UI_ACTION_CHOOSE) edit_text( "Search games", l->search, sizeof(l->search) );
+            break;
+        case 1:
+            l->favorites_only = action == UI_ACTION_RESET ? 0 : !l->favorites_only;
+            break;
+        case 2:
+            if (action == UI_ACTION_RESET) l->sort_order = 0;
+            else l->sort_order = (l->sort_order + (action == UI_ACTION_LEFT ? 2 : 1)) % 3;
+            break;
+        case 3:
+            if (action == UI_ACTION_CHOOSE) settings_menu( l );
+            break;
+        }
+    }
+}
+
+/***********************************************************************
+ * File browser
+ */
+
+static int compare_files( const void *a, const void *b )
+{
+    const struct file_entry *x = a, *y = b;
+
+    if (x->is_dir != y->is_dir) return y->is_dir - x->is_dir;
+    return strcasecmp( x->name, y->name );
+}
+
+static int read_dir( struct launcher *l, const char *dir, int *count, int images )
+{
+    struct dirent *entry;
+    DIR *handle;
+
+    *count = 0;
+    if (!(handle = opendir( dir ))) return 0;
+    while (*count < MAX_FILES && (entry = readdir( handle )))
+    {
+        struct file_entry *file = files + *count;
+        char path[512];
+        struct stat st;
+
+        if (entry->d_name[0] == '.') continue;
+        if ((size_t)snprintf( path, sizeof(path), "%s%s%s", dir, is_root( dir ) && dir[strlen( dir ) - 1] == '/' ? "" : "/",
+                              entry->d_name ) >= sizeof(path)) continue;
+        if (entry->d_type == DT_DIR) file->is_dir = 1;
+        else if (entry->d_type == DT_REG) file->is_dir = 0;
+        else if (stat( path, &st )) continue;
+        else file->is_dir = S_ISDIR( st.st_mode );
+        if (!file->is_dir)
+        {
+            const char *extension = strrchr( entry->d_name, '.' );
+            if (images ? (!extension || (strcasecmp( extension, ".png" ) && strcasecmp( extension, ".jpg" ) &&
+                                        strcasecmp( extension, ".jpeg" ))) : !launcher_is_exe( entry->d_name )) continue;
+        }
+        snprintf( file->name, sizeof(file->name), "%s", entry->d_name );
+        file->supported = images || file->is_dir || !l->options->machine_of( path, &file->machine );
+        (*count)++;
+    }
+    closedir( handle );
+    qsort( files, *count, sizeof(files[0]), compare_files );
+    return 1;
+}
+
+static void join_path( char *out, size_t size, const char *dir, const char *name )
+{
+    snprintf( out, size, "%s%s%s", dir, dir[strlen( dir ) - 1] == '/' ? "" : "/", name );
+}
+
+static int directory_exists( const char *path )
+{
+    struct stat st;
+
+    return !stat( path, &st ) && S_ISDIR( st.st_mode );
+}
+
+static int path_below( const char *path, const char *root )
+{
+    size_t length = strlen( root );
+
+    return !strncmp( path, root, length );
+}
+
+/* Choose the filesystem before showing any folders. The saved directory is
+ * kept within the chosen filesystem, but never skips this screen. */
+static int file_browser_storage( struct launcher *l, char *dir, size_t size, const char *title )
+{
+    struct ui *ui = &l->ui;
+    static const char *const usb_paths[] = { "ums0:/", "ums1:/", "ums2:/", "ums3:/", "ums4:/" };
+    static const char *const usb_names[] = { "USB 1", "USB 2", "USB 3", "USB 4", "USB 5" };
+    struct wine_nx_launcher_usb_volume mounted[LAUNCHER_MAX_USB_VOLUMES];
+    int mounted_count, i;
+
+    for (;;)
+    {
+        struct ui_list list = {0};
+        struct ui_row rows[2] = {0};
+        enum ui_action action;
+
+        memset( mounted, 0, sizeof(mounted) );
+        if (l->options->list_usb)
+            mounted_count = l->options->list_usb( mounted, LAUNCHER_MAX_USB_VOLUMES );
+        else
+        {
+            mounted_count = 0;
+            for (i = 0; i < LAUNCHER_USB_DRIVES; i++)
+                if (directory_exists( usb_paths[i] ))
+                {
+                    snprintf( mounted[mounted_count].path, sizeof(mounted[mounted_count].path), "%s", usb_paths[i] );
+                    snprintf( mounted[mounted_count].label, sizeof(mounted[mounted_count].label), "%s", usb_names[i] );
+                    mounted[mounted_count++].drive = 'D' + i;
+                }
+        }
+
+        snprintf( rows[0].label, sizeof(rows[0].label), "SD Card" );
+        snprintf( rows[0].value, sizeof(rows[0].value), "C: and Z:" );
+        snprintf( rows[1].label, sizeof(rows[1].label), "USB" );
+        if (mounted_count)
+            snprintf( rows[1].value, sizeof(rows[1].value), mounted_count == 1 ? "1 volume" : "%d volumes",
+                      mounted_count );
+        else
+            snprintf( rows[1].value, sizeof(rows[1].value), "Not connected" );
+
+        action = ui_list_run( ui, &list, title, "Choose storage", rows, 2, 0 );
+        if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return 0;
+        if (action != UI_ACTION_CHOOSE) continue;
+        if (!list.selection)
+        {
+            if (path_below( l->browse_dir, "sdmc:/" ) && directory_exists( l->browse_dir ))
+                snprintf( dir, size, "%s", l->browse_dir );
+            else if (directory_exists( LAUNCHER_DRIVE_C ))
+                snprintf( dir, size, "%s", LAUNCHER_DRIVE_C );
+            else snprintf( dir, size, "sdmc:/" );
+            return 1;
+        }
+        if (list.selection == 1 && !mounted_count)
+        {
+            ui_message( ui, "USB", "No mounted USB volume was found. Connect a drive, then try again." );
+            continue;
+        }
+        if (list.selection == 1 && mounted_count == 1)
+        {
+            if (path_below( l->browse_dir, mounted[0].path ) && directory_exists( l->browse_dir ))
+                snprintf( dir, size, "%s", l->browse_dir );
+            else snprintf( dir, size, "%s", mounted[0].path );
+            return 1;
+        }
+        if (list.selection == 1)
+        {
+            struct ui_list volumes = {0};
+            enum ui_action volume_action;
+
+            for (i = 0; i < mounted_count; i++)
+            {
+                memset( file_rows + i, 0, sizeof(file_rows[0]) );
+                snprintf( file_rows[i].label, sizeof(file_rows[i].label), "%s", mounted[i].label );
+                snprintf( file_rows[i].value, sizeof(file_rows[i].value), "%c:", mounted[i].drive );
+            }
+            volume_action = ui_list_run( ui, &volumes, "USB", "Choose a volume", file_rows,
+                                         mounted_count, 0 );
+            if (volume_action == UI_ACTION_QUIT) return 0;
+            if (volume_action == UI_ACTION_BACK) continue;
+            if (volume_action != UI_ACTION_CHOOSE) continue;
+            if (path_below( l->browse_dir, mounted[volumes.selection].path ) && directory_exists( l->browse_dir ))
+                snprintf( dir, size, "%s", l->browse_dir );
+            else snprintf( dir, size, "%s", mounted[volumes.selection].path );
+            return 1;
+        }
+    }
+}
+
+static int file_browser_pick_kind( struct launcher *l, char *target, size_t size, int images )
+{
+    struct ui *ui = &l->ui;
+    char dir[512], came_from[256] = "", dos[512], path[512];
+
+    for (;;)
+    {
+        int choose_storage = 0;
+
+        if (!file_browser_storage( l, dir, sizeof(dir), images ? "Choose icon" : "Add Game" ))
+        {
+            save_look( l );
+            return 0;
+        }
+        came_from[0] = 0;
+        while (!choose_storage)
+        {
+            struct ui_list list = {0};
+            int count, has_up, readable, rows, i, reload = 0;
+
+            while (!(readable = read_dir( l, dir, &count, images )) && !is_root( dir )) parent_dir( dir );
+            if (!readable)
+            {
+                choose_storage = 1;
+                continue;
+            }
+            snprintf( l->browse_dir, sizeof(l->browse_dir), "%s", dir );
+            has_up = !is_root( dir );
+            if (!launcher_dos_path( dir, dos, sizeof(dos) )) snprintf( dos, sizeof(dos), "%s", dir );
+
+            rows = 0;
+            if (has_up)
+            {
+                char parent[512], parent_dos[512];
+
+                snprintf( parent, sizeof(parent), "%s", dir );
+                parent_dir( parent );
+                memset( file_rows, 0, sizeof(file_rows[0]) );
+                snprintf( file_rows[0].label, sizeof(file_rows[0].label), "Up one folder" );
+                if (launcher_dos_path( parent, parent_dos, sizeof(parent_dos) ))
+                    snprintf( file_rows[0].value, sizeof(file_rows[0].value), "%s", parent_dos );
+                rows = 1;
+            }
+            for (i = 0; i < count; i++, rows++)
+            {
+                struct ui_row *row = file_rows + rows;
+
+                memset( row, 0, sizeof(*row) );
+                snprintf( row->label, sizeof(row->label), "%s", files[i].name );
+                if (files[i].is_dir) snprintf( row->value, sizeof(row->value), "Folder" );
+                else if (!files[i].supported)
+                {
+                    snprintf( row->value, sizeof(row->value), "Cannot run here" );
+                    row->disabled = 1;
+                }
+                else snprintf( row->value, sizeof(row->value), "%s", images ? "Image" : launcher_machine_name( files[i].machine ) );
+                if (came_from[0] && !strcasecmp( files[i].name, came_from )) list.selection = rows;
+            }
+            if (!rows)
+            {
+                memset( file_rows, 0, sizeof(file_rows[0]) );
+                snprintf( file_rows[0].label, sizeof(file_rows[0].label), "%s", images ? "No folders or images here" : "No folders or programs here" );
+                file_rows[0].disabled = 1;
+                rows = 1;
+            }
+            /* A folder opens on its first entry; going up returns to the folder left. */
+            if (!came_from[0] && has_up && rows > 1) list.selection = 1;
+            came_from[0] = 0;
+
+            while (!reload)
+            {
+                enum ui_action action = ui_list_run( ui, &list, images ? "Choose icon" : "Files", dos, file_rows, rows, 0 );
+                int index = list.selection - has_up;
+
+                if (action == UI_ACTION_QUIT) return 0;
+                if (action == UI_ACTION_BACK || (action == UI_ACTION_CHOOSE && index < 0))
+                {
+                    if (!has_up)
+                    {
+                        choose_storage = 1;
+                        break;
+                    }
+                    snprintf( came_from, sizeof(came_from), "%s", file_name( dir ) );
+                    parent_dir( dir );
+                    reload = 1;
+                    break;
+                }
+                if (action != UI_ACTION_CHOOSE) continue;
+                if (index < 0 || index >= count) continue;
+                join_path( path, sizeof(path), dir, files[index].name );
+                launcher_log( "[LAUNCHER] Browser chose %s (%s)", path,
+                              files[index].is_dir ? "folder" : images ? "image" : "program" );
+                if (files[index].is_dir)
+                {
+                    snprintf( dir, sizeof(dir), "%s", path );
+                    reload = 1;
+                }
+                else
+                {
+                    snprintf( target, size, "%s", path );
+                    save_look( l );
+                    return 1;
+                }
+            }
+        }
+    }
+}
+
+static int file_browser_pick( struct launcher *l, char *target, size_t size )
+{
+    return file_browser_pick_kind( l, target, size, 0 );
+}
+
+static int pick_forwarder_icon( void *opaque, char *target, size_t size )
+{
+    struct launcher *l = opaque;
+    char previous[sizeof(l->browse_dir)];
+    int result;
+    strcpy( previous, l->browse_dir );
+    result = file_browser_pick_kind( l, target, size, 1 );
+    strcpy( l->browse_dir, previous );
+    save_look( l );
+    return result;
+}
+
+/* A program started from the file browser and left out of the library: a
+ * setup, a patch, a tool. It runs with the settings a new game would have,
+ * or its own if it already has a file of them. */
+static int run_once( struct launcher *l, char *target, size_t size )
+{
+    struct program program;
+    char path[512];
+    int index;
+
+    if (!file_browser_pick( l, path, sizeof(path) )) return 0;
+    launcher_log( "[LAUNCHER] Run once: %s", path );
+    if ((index = find_program( l, path )) >= 0) return start_program( l, &l->programs[index], target, size );
+    if (!describe_program( l, &program, path ))
+    {
+        ui_message( &l->ui, "Run a program once", "Autorun cannot run this executable." );
+        return 0;
+    }
+    return start_program( l, &program, target, size );
+}
+
+static int add_game( struct launcher *l )
+{
+    struct program program;
+    char path[512], message[800];
+    int index;
+
+    if (!file_browser_pick( l, path, sizeof(path) )) return -1;
+    launcher_log( "[LAUNCHER] Add Game selected %s", path );
+    if ((index = find_program( l, path )) >= 0)
+    {
+        ui_message( &l->ui, "Add Game", "This game is already in your library." );
+        return index;
+    }
+    if (!describe_program( l, &program, path ))
+    {
+        ui_message( &l->ui, "Add Game", "Autorun cannot run this executable." );
+        return -1;
+    }
+    for (;;)
+    {
+        static const struct ui_hint hints[] = { { UI_A, "Add" }, { UI_X, "Rename" }, { UI_B, "Cancel" } };
+        char name[128];
+        int answer;
+
+        snprintf( message, sizeof(message), "%s\n\n%s\n\nAdd this game to your library?",
+                  program.title, program.dos );
+        answer = ui_ask( &l->ui, "Review Game", message, hints, 3 );
+        if (answer == UI_A) break;
+        if (answer != UI_X)
+        {
+            launcher_log( "[LAUNCHER] Add Game cancelled during review" );
+            return -1;
+        }
+        /* Named before it is added, because the name is what the library is
+         * sorted and searched by. It is kept in the file beside the program. */
+        snprintf( name, sizeof(name), "%s", program.title );
+        if (launcher_platform_prompt( "Name", name, name, sizeof(name) ) && name[0])
+        {
+            snprintf( program.settings.title, sizeof(program.settings.title), "%s", name );
+            snprintf( program.title, sizeof(program.title), "%s", name );
+            save_program_settings( l, &program );
+        }
+        ui_start_screen( &l->ui );
+    }
+    if (l->program_count >= LAUNCHER_MAX_ENTRIES)
+    {
+        ui_message( &l->ui, "Add Game", "The library is full." );
+        return -1;
+    }
+    index = l->program_count;
+    l->programs[index] = program;
+    l->programs[index].added = 1;
+    l->programs[index].catalog_id = l->catalog.next_id;
+    l->programs[index].added_order = l->catalog.next_order;
+    l->program_count++;
+    if (!save_library( l ))
+    {
+        l->program_count--;
+        return -1;
+    }
+    apply_new_game_renderer( l, &l->programs[index] );
+    launcher_log( "[LAUNCHER] Added %s to the library", path );
+    ui_toast( &l->ui, launcher_fixes_pending( l->fixes, path ) ?
+              "Game added. It has a fix, offered when it starts" : "Game added to the library", 2500 );
+    return index;
+}
+
+/***********************************************************************
+ * The library and the entry point
+ */
+
+/* The game the D-pad is on: Home's history, or the library's grid. */
+static struct program *current_program( struct launcher *l, int home )
+{
+    if (home) return l->history_count ? &l->programs[l->history[l->history_selection]] : NULL;
+    return l->visible_count ? &l->programs[l->visible[l->selection]] : NULL;
+}
+
+static int current_index( const struct launcher *l, int home )
+{
+    if (home) return l->history_count ? l->history[l->history_selection] : -1;
+    return l->visible_count ? l->visible[l->selection] : -1;
+}
+
+/* A game can be in either list, so both are rebuilt together. */
+static void rebuild_lists( struct launcher *l, int keep_index )
+{
+    rebuild_visible( l, keep_index );
+    rebuild_history( l, keep_index );
+}
+
+static int usb_program_path( const char *path )
+{
+    return !strncasecmp( path, "ums", 3 ) && path[3] >= '0' && path[3] <= '4' &&
+           path[4] == ':' && (path[5] == '/' || path[5] == '\\');
+}
+
+static int refresh_usb_programs( struct launcher *l )
+{
+    int changed = 0, i;
+
+    for (i = 0; i < l->program_count; i++)
+    {
+        struct program *p = l->programs + i;
+        unsigned short machine;
+        int available;
+
+        if (p->removed || !usb_program_path( p->path )) continue;
+        available = file_exists( p->path ) && !l->options->machine_of( p->path, &machine );
+        if (available == !p->missing) continue;
+        p->missing = !available;
+        if (available)
+        {
+            p->machine = machine;
+            p->resource_title[0] = 0;
+            launcher_pe_describe( p->path, 0, NULL, p->resource_title, sizeof(p->resource_title) );
+            load_program_settings( l, p );
+            if (!p->icon) p->icon_state = ICON_UNKNOWN;
+            if (!p->square_icon) p->square_state = ICON_UNKNOWN;
+            if (!p->hero_icon) p->hero_state = ICON_UNKNOWN;
+        }
+        changed++;
+    }
+    return changed;
+}
+
+static void show_library( struct launcher *l, int *home, struct ui *ui )
+{
+    if (*home) ui_start_screen( ui );
+    *home = 0;
+    l->zone = ZONE_CONTENT;
+    l->header_focus = SHELL_LIBRARY;
+}
+
+static int run_library( struct launcher *l, char *target, size_t size )
+{
+    struct ui *ui = &l->ui;
+    struct ui_input input;
+    /* Home lists what has been played, so until something has it opens the library. */
+    int home = l->history_count > 0;
+
+    l->zone = ZONE_CONTENT;
+    l->header_focus = home ? SHELL_HOME : SHELL_LIBRARY;
+    ui_start_screen( ui );
+    while (ui_begin_frame( ui ))
+    {
+        struct grid g;
+        int previous = current_index( l, home ), previous_home = home;
+        int previous_zone = l->zone, previous_header = l->header_focus;
+
+        grid_layout( l, &g );
+        pump_icons( l );
+        while (ui_poll( ui, &input ))
+        {
+            struct program *p = current_program( l, home );
+            int keep = current_index( l, home ), hit;
+
+            switch (input.touch)
+            {
+            case UI_TOUCH_TAP:
+            {
+                SDL_Point point = { input.x, input.y };
+                int tab;
+
+                for (tab = SHELL_HOME; tab < SHELL_TABS; tab++)
+                    if (SDL_PointInRect( &point, &l->shell_hits[tab] )) break;
+                if (tab < SHELL_TABS)
+                {
+                    l->zone = ZONE_HEADER;
+                    l->header_focus = tab;
+                    input.button = UI_A;
+                    break;
+                }
+                if (input.y < UI_HEADER_HEIGHT) break;
+                if (home)
+                {
+                    if (SDL_PointInRect( &point, &l->add_hit )) show_library( l, &home, ui );
+                    else if ((hit = carousel_hit( l, input.x, input.y )) >= 0)
+                    {
+                        l->zone = ZONE_CONTENT;
+                        if (hit == l->history_selection) input.button = UI_A;
+                        else l->history_selection = hit;
+                    }
+                }
+                else
+                {
+                    if ((hit = grid_hit( l, input.x, input.y )) < 0) break;
+                    l->zone = ZONE_CONTENT;
+                    if (hit == l->selection && p) input.button = UI_A;
+                    else l->selection = hit;
+                }
+                break;
+            }
+            case UI_TOUCH_SWIPE_LEFT:
+            case UI_TOUCH_SCROLL_UP:
+                if (home)
+                {
+                    if (l->history_selection + 1 < l->history_count) l->history_selection++;
+                }
+                else l->selection = launcher_grid_page( l->selection, l->visible_count, g.columns, g.rows, 1 );
+                break;
+            case UI_TOUCH_SWIPE_RIGHT:
+            case UI_TOUCH_SCROLL_DOWN:
+                if (home)
+                {
+                    if (l->history_selection > 0) l->history_selection--;
+                }
+                else l->selection = launcher_grid_page( l->selection, l->visible_count, g.columns, g.rows, -1 );
+                break;
+            default:
+                break;
+            }
+
+            /* A on the header acts on the item the D-pad is on, whatever the view. */
+            if (input.button == UI_A || input.button == UI_PLUS || input.button == UI_MINUS ||
+                (input.button == UI_Y && p)) ui_sound( ui, LAUNCHER_SOUND_ACCEPT );
+            else if (input.button == UI_B) ui_sound( ui, LAUNCHER_SOUND_BACK );
+            if (input.button == UI_A && l->zone == ZONE_HEADER)
+            {
+                switch (l->header_focus)
+                {
+                case SHELL_HOME:
+                case SHELL_LIBRARY:
+                {
+                    int to_home = l->header_focus == SHELL_HOME;
+
+                    if (to_home != home) ui_start_screen( ui );
+                    home = to_home;
+                    /* The view changes under it; what the D-pad is on does not,
+                     * so the next press still moves along the header. */
+                    input.button = UI_NONE;
+                    break;
+                }
+                default:
+                    settings_menu( l );
+                    rebuild_lists( l, keep );
+                    ui_start_screen( ui );
+                    input.button = UI_NONE;
+                    break;
+                }
+            }
+
+            switch (input.button)
+            {
+            case UI_LEFT:
+            case UI_RIGHT:
+            {
+                int step = input.button == UI_LEFT ? -1 : 1;
+
+                if (l->zone == ZONE_HEADER)
+                {
+                    int next = l->header_focus + step;
+
+                    if (next >= SHELL_HOME && next < SHELL_TABS) l->header_focus = next;
+                }
+                else if (home)
+                {
+                    if (step < 0 && l->history_selection > 0) l->history_selection--;
+                    if (step > 0 && l->history_selection + 1 < l->history_count) l->history_selection++;
+                }
+                else l->selection = launcher_grid_move( l->selection, l->visible_count, g.columns, g.rows, step, 0 );
+                break;
+            }
+            case UI_UP:
+            case UI_DOWN:
+            {
+                int down = input.button == UI_DOWN;
+
+                if (l->zone == ZONE_HEADER)
+                {
+                    if (down) l->zone = ZONE_CONTENT;
+                }
+                else if (home)
+                {
+                    if (!down)
+                    {
+                        l->zone = ZONE_HEADER;
+                        l->header_focus = SHELL_HOME;
+                    }
+                }
+                else
+                {
+                    int next = launcher_grid_move( l->selection, l->visible_count, g.columns, g.rows, 0, down ? 1 : -1 );
+
+                    /* The top row has nowhere above it but the header. */
+                    if (next == l->selection && !down)
+                    {
+                        l->zone = ZONE_HEADER;
+                        l->header_focus = SHELL_LIBRARY;
+                    }
+                    l->selection = next;
+                }
+                break;
+            }
+            case UI_ZL:
+            case UI_ZR:
+                if (!home)
+                {
+                    l->selection = launcher_grid_page( l->selection, l->visible_count, g.columns, g.rows,
+                                                       input.button == UI_ZL ? -1 : 1 );
+                    l->zone = ZONE_CONTENT;
+                }
+                break;
+            case UI_L:
+            case UI_R:
+                if (home != (input.button == UI_L)) ui_start_screen( ui );
+                home = input.button == UI_L;
+                l->zone = ZONE_CONTENT;
+                l->header_focus = home ? SHELL_HOME : SHELL_LIBRARY;
+                break;
+            case UI_A:
+                if (!p)
+                {
+                    /* Home with nothing played opens the library; the library adds a game. */
+                    if (home) show_library( l, &home, ui );
+                    else
+                    {
+                        int added_index = add_game( l );
+
+                        if (added_index >= 0) rebuild_lists( l, added_index );
+                        ui_start_screen( ui );
+                    }
+                    break;
+                }
+                if (l->zone == ZONE_CONTENT)
+                {
+                    /* A on a game plays it; Y opens its Options menu. */
+                    if (start_program( l, p, target, size )) return 1;
+                    ui_start_screen( ui );
+                }
+                else
+                {
+                    if (program_menu( l, p, target, size )) return 1;
+                    rebuild_lists( l, keep );
+                    ui_start_screen( ui );
+                }
+                break;
+            case UI_Y:
+                if (!p) break;
+                if (program_menu( l, p, target, size )) return 1;
+                rebuild_lists( l, keep );
+                ui_start_screen( ui );
+                break;
+            case UI_X:
+                break;
+            case UI_MINUS:
+                if (home) settings_menu( l );
+                else library_menu( l );
+                rebuild_lists( l, keep );
+                ui_start_screen( ui );
+                break;
+            case UI_PLUS:
+            {
+                static const char *const items[] = { "Add game", "Run a program once", "Exit Autorun" };
+                int chosen = ui_menu( ui, "Autorun", items, 3, 0 );
+
+                ui_start_screen( ui );
+                if (chosen == 1)
+                {
+                    if (run_once( l, target, size )) return 1;
+                    ui_start_screen( ui );
+                }
+                else if (chosen == 2)
+                {
+                    if (ui_confirm( ui, "Exit Autorun", "Close Autorun and go back to the Homebrew Menu?",
+                                    "Exit" )) return 0;
+                    ui_start_screen( ui );
+                }
+                else if (!chosen)
+                {
+                    int added_index = add_game( l );
+
+                    if (added_index >= 0)
+                    {
+                        rebuild_lists( l, added_index );
+                        show_library( l, &home, ui );
+                    }
+                    ui_start_screen( ui );
+                }
+                break;
+            }
+            case UI_B:
+                if (l->zone != ZONE_CONTENT)
+                {
+                    l->zone = ZONE_CONTENT;
+                    break;
+                }
+                if (ui_confirm( ui, "Quit", "Close Autorun and go back to the Homebrew Menu?", "Quit" )) return 0;
+                ui_start_screen( ui );
+                break;
+            }
+            if (!ui->running) return 0;
+        }
+        if (!ui->running) break;
+        if (previous != current_index( l, home ) || previous_home != home ||
+            previous_zone != l->zone || previous_header != l->header_focus) ui_sound( ui, LAUNCHER_SOUND_MOVE );
+        if (SDL_AtomicCAS( &l->usb_changed, 1, 0 ))
+        {
+            int keep = current_index( l, home );
+            int changed = refresh_usb_programs( l );
+
+            if (changed)
+            {
+                char message[80];
+
+                rebuild_lists( l, keep );
+                snprintf( message, sizeof(message), changed == 1 ? "%d USB game refreshed" : "%d USB games refreshed",
+                          changed );
+                launcher_log( "[LAUNCHER] %s after a mount change", message );
+                ui_toast( ui, message, 1800 );
+            }
+        }
+        l->icon_frame = l->icon_use;
+        if (home) draw_home( l );
+        else draw_library( l );
+        ui_present( ui );
+        ui_wait( ui );
+    }
+    return 0;
+}
+
+/* Art asked for before the first frame, as tico does, so neither Home nor the
+ * library opens on bare cards: the least wanted first, since the worker takes
+ * the newest request first -- the library's first pages, then Home's covers,
+ * then the backdrop Home opens on. */
+static void preload_art( struct launcher *l )
+{
+    struct grid g;
+    int i;
+
+    if (!l->thread) return;
+    grid_layout( l, &g );
+    for (i = g.first + 3 * g.columns * g.rows; i-- > g.first;)
+        if (i < l->visible_count) prefetch_card( l, i );
+    for (i = l->history_count; i-- > 0;) request_icon( l, l->history[i] );
+    for (i = 2; i >= 0; i--)
+    {
+        if (l->history_selection + i < l->history_count) request_art( l, l->history[l->history_selection + i], ART_HERO );
+        if (i && l->history_selection - i >= 0) request_art( l, l->history[l->history_selection - i], ART_HERO );
+    }
+}
+
+/* What runs between frames: the release check, the DLL check and the game
+ * fixes check. */
+static void background_tick( void *data )
+{
+    struct launcher *l = data;
+
+    launcher_update_tick( l->update );
+    launcher_dlls_tick( l->dlls );
+    if (launcher_fixes_tick( l->fixes )) l->fixes_notice = 1;
+    if (l->fixes_notice && !l->ui.modal_depth)
+    {
+        char text[96];
+        int i, pending = 0;
+
+        l->fixes_notice = 0;
+        for (i = 0; i < l->program_count; i++)
+            pending += l->programs[i].added && launcher_fixes_pending( l->fixes, l->programs[i].path );
+        if (pending == 1) ui_notice( &l->ui, "A game in your library has a new fix" );
+        else if (pending)
+        {
+            snprintf( text, sizeof(text), "%d games in your library have new fixes", pending );
+            ui_notice( &l->ui, text );
+        }
+    }
+}
+
+int wine_nx_launcher_run( struct wine_nx_launcher_options *options, char *target, size_t target_size )
+{
+    struct launcher *l = &launcher;
+    const void *font = NULL;
+    size_t font_size = 0;
+    char path[512];
+    int ret, i, added, missing;
+    Uint32 started;
+
+    memset( l, 0, sizeof(*l) );
+    l->options = options;
+    runtime_file( l, "launcher.txt", path, sizeof(path) );
+    launcher_kv_load( &l->look, path );
+    {
+        char language[16] = "";
+        launcher_kv_get( &l->look, "language", language, sizeof(language) );
+        launcher_set_language( language );
+    }
+    l->show_hidden = launcher_kv_get_int( &l->look, "show-hidden", 0 ) == 1;
+    l->hide_missing = launcher_kv_get_int( &l->look, "hide-missing", 0 ) == 1;
+    if (!launcher_kv_get( &l->look, "browse", l->browse_dir, sizeof(l->browse_dir) ) || !l->browse_dir[0])
+        snprintf( l->browse_dir, sizeof(l->browse_dir), "%s", LAUNCHER_DRIVE_C );
+
+    started = SDL_GetTicks();
+    /* The steps of coming up, on the card before each is taken: the launcher
+     * that froze a console said nothing between the settings and its first
+     * frame, and the log has to name the call that did not return. */
+    launcher_log( "[LAUNCHER] bringing the screen up: the shared font" );
+    if (!launcher_platform_font( &font, &font_size ) ||
+        !ui_init( &l->ui, font, font_size, 1 ))
+    {
+        launcher_platform_font_release();
+        /* libnx's console cannot draw once EGL has had the screen. */
+        if (ui_screen_used())
+        {
+            launcher_log( "[LAUNCHER] SDL could not start (%s) after taking the screen; closing", ui_error() );
+            return 0;
+        }
+        launcher_log( "[LAUNCHER] SDL could not start (%s); showing the text menu",
+                      font ? ui_error() : "no shared font from the pl service" );
+#ifdef __SWITCH__
+        consoleInit( NULL );
+        ret = wine_nx_launcher_console_run( LAUNCHER_DRIVE_C, options->runtime_dir, options->build, options->machine_of,
+                                            &options->verbose, &options->profile, target, target_size );
+        consoleExit( NULL );
+        return ret;
+#else
+        return 0;
+#endif
+    }
+    /* ui_init starts from a cleared screen, so the clock and the battery are
+     * handed to it once it stands. */
+    l->ui.header_status = header_status;
+    l->ui.header_status_data = l;
+    l->ui.footer_mark = footer_mark;
+    l->usb_event = SDL_RegisterEvents( 1 );
+    if (l->usb_event == (Uint32)-1) l->usb_event = SDL_USEREVENT;
+
+    {
+        SDL_RendererInfo info;
+
+        if (SDL_GetRendererInfo( l->ui.renderer, &info )) info.name = "unknown";
+        launcher_log( "[LAUNCHER] SDL %s video, %s renderer, font %zu bytes, ready in %u ms",
+                      SDL_GetCurrentVideoDriver(), info.name, font_size,
+                      SDL_GetTicks() - started );
+    }
+    {
+        static const struct { const struct launcher_svg_icon *icon; int size; } symbols[SYMBOL_COUNT] =
+        {
+            [SYMBOL_HOME] = { &icon_gamepad_modern, SHELL_ICON },
+            [SYMBOL_LIBRARY] = { &icon_grid, SHELL_ICON - 4 },
+            [SYMBOL_ADD] = { &icon_plus, SHELL_ICON - 4 },
+            [SYMBOL_SETTINGS] = { &icon_sliders, SHELL_ICON - 4 },
+        };
+
+        for (i = 0; i < SYMBOL_COUNT; i++)
+            l->symbols[i] = ui_svg_texture( &l->ui, symbols[i].icon->d, symbols[i].icon->x, symbols[i].icon->y,
+                                            symbols[i].icon->width, symbols[i].icon->height, symbols[i].size );
+    }
+    l->logo = load_logo( l );
+    l->backdrop = l->backdrop_previous = -1;
+    start_icons( l );
+    started = SDL_GetTicks();
+    load_library( l );
+    rebuild_visible( l, -1 );
+    rebuild_history( l, -1 );
+    for (i = 0, added = 0; i < l->program_count; i++) added += l->programs[i].added;
+    launcher_log( "[LAUNCHER] %d catalog games (%d registered, %d shown) loaded in %u ms; icons %s",
+                  l->program_count, added, l->visible_count, SDL_GetTicks() - started,
+                  l->thread ? "load on a worker thread" : "off: no worker thread" );
+    for (i = 0; i < l->visible_count; i++)
+    {
+        const struct program *p = &l->programs[l->visible[i]];
+
+        if (!strcasecmp( p->path, target ) || !strcasecmp( p->dos, target )) l->selection = i;
+    }
+    for (i = 0; i < l->history_count; i++)
+    {
+        const struct program *p = &l->programs[l->history[i]];
+
+        if (!strcasecmp( p->path, target ) || !strcasecmp( p->dos, target )) l->history_selection = i;
+    }
+    preload_art( l );
+    if (!autorun_install_finish( options->runtime_dir ))
+        ui_toast( &l->ui, "The update recovery files could not be cleared.", 5000 );
+    l->update = launcher_update_create( &l->ui, options->runtime_dir, options->schedule_restart );
+    l->dlls = launcher_dlls_create( &l->ui, options->runtime_dir );
+    l->fixes = launcher_fixes_create( &l->ui, options->runtime_dir );
+    l->graphics = launcher_graphics_create( &l->ui, options->runtime_dir );
+    l->ui.background_tick = background_tick;
+    l->ui.background_data = l;
+    offer_quick_setup( l );
+    if (options->launch_error) ui_message( &l->ui, "Game unavailable", options->launch_error );
+    ret = l->ui.running ? run_library( l, target, target_size ) : 0;
+    l->ui.background_tick = NULL;
+    launcher_update_destroy( l->update );
+    l->update = NULL;
+    launcher_dlls_destroy( l->dlls );
+    l->dlls = NULL;
+    launcher_fixes_destroy( l->fixes );
+    l->fixes = NULL;
+    launcher_graphics_destroy( l->graphics );
+    l->graphics = NULL;
+    for (i = 0, added = 0, missing = 0; i < l->program_count; i++)
+    {
+        added += l->programs[i].icon_state == ICON_READY;
+        missing += l->programs[i].icon_state == ICON_MISSING;
+    }
+    launcher_log( "[LAUNCHER] %s; %d icons shown, %d programs without one", ret ? "starting a program" : "closed",
+                  added, missing );
+    stop_icons( l );
+    for (i = 0; i < SYMBOL_COUNT; i++)
+        if (l->symbols[i]) SDL_DestroyTexture( l->symbols[i] );
+    if (l->logo) SDL_DestroyTexture( l->logo );
+    l->usb_event = 0;
+    ui_quit( &l->ui );
+    launcher_platform_font_release();
+    return ret;
+}
